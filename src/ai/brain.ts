@@ -14,7 +14,7 @@ import {
   SLOW_CALL_TIMEOUT_MS,
 } from './gemini';
 import {
-  TUTOR_PERSONA, PLAN_SCHEMA, PLACEMENT_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, turnSystemPrompt, turnUserPrompt,
+  TUTOR_PERSONA, PLAN_SCHEMA, PLACEMENT_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, DEBRIEF_SCHEMA, turnSystemPrompt, turnUserPrompt,
   placementSynthesisPrompt, glossPrompt, storyPrompt, registerPrompt, debriefPrompt, planRepairPrompt, curriculumDigest,
   type PlanRequest,
 } from './prompts';
@@ -187,7 +187,8 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: debriefPrompt(a.plan, a.transcript, a.profile.style.correctionTiming),
-      thinking: 'balanced', maxOutputTokens: 8192,
+      schema: DEBRIEF_SCHEMA,
+      thinking: 'balanced', maxOutputTokens: 4096,
     });
     return { debrief: normalizeDebrief(res.json), meta: metaOf(res) };
   }
@@ -350,17 +351,22 @@ export function normalizeFeedback(j: any, beat: Beat, level: string): Feedback {
 }
 
 function normalizeDebrief(j: any): Debrief {
+  const highlights = Array.isArray(j?.highlights) ? j.highlights.filter((x: unknown) => typeof x === 'string').slice(0, 4) : [];
+  const toKeep = Array.isArray(j?.toKeep) ? j.toKeep.slice(0, 3).map((n: any) => ({
+    quote: String(n?.quote ?? ''), tag: String(n?.tag ?? 'vocab.collocation'), issue: String(n?.issue ?? ''), recast: String(n?.recast ?? ''),
+    elicit: String(n?.elicit ?? 'どう 言えば いいと 思いますか？'), severity: (Math.max(1, Math.min(3, Number(n?.severity) || 2)) as 1 | 2 | 3),
+  })) : [];
+  const newCards = Array.isArray(j?.newCards) ? j.newCards.slice(0, 4).map((card: any) => ({
+    surface: String(card?.surface ?? ''), reading: String(card?.reading ?? ''), meaning: String(card?.meaning ?? ''),
+  })).filter((card: any) => card.surface) : [];
   return {
-    headline: j?.headline ?? 'Session complete.',
-    highlights: j?.highlights ?? [],
-    toKeep: (j?.toKeep ?? []).map((n: any) => ({
-      quote: n.quote ?? '', tag: n.tag ?? 'vocab.collocation', issue: '', recast: n.recast ?? '',
-      elicit: n.elicit ?? 'どう 言えば いいと 思いますか？', severity: 2 as const,
-    })),
-    newCards: j?.newCards ?? [],
-    canDoAdvanced: j?.canDoAdvanced ?? '',
-    nextTeaser: j?.nextTeaser ?? '',
-    notebook: j?.notebook ?? '',
+    headline: String(j?.headline ?? 'Session complete.'),
+    highlights,
+    toKeep,
+    newCards,
+    canDoAdvanced: String(j?.canDoAdvanced ?? ''),
+    nextTeaser: String(j?.nextTeaser ?? ''),
+    notebook: String(j?.notebook ?? ''),
   };
 }
 

@@ -312,21 +312,42 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(91,124,250,.
 .gloss .r { color: var(--shu); font-family: var(--jp); }
 
 /* conversation */
-.chat { display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow-y: auto; padding-right: 4px; }
-.msg { display: flex; gap: 10px; align-items: flex-start; }
+.scenario-card { margin-bottom: 14px; }
+.scenario-topline { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.scenario-kicker { color: var(--ai); font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.scenario-title { font-size: 19px; margin: 9px 0 13px; line-height: 1.35; }
+.scenario-roles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.scenario-role { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.scenario-role-label { display: block; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 2px; }
+.scenario-goal { display: flex; gap: 9px; align-items: baseline; margin-top: 12px; padding: 10px 12px; background: var(--ai-soft); border: 1px solid rgba(91,124,250,.24); border-radius: 10px; }
+.scenario-goal strong { color: #dbe3ff; white-space: nowrap; }
+.scenario-goal span { overflow-wrap: anywhere; }
+.scenario-constraints { margin-top: 9px; }
+.chat { display: flex; flex-direction: column; gap: 12px; max-height: 60vh; overflow-y: auto; padding: 2px 4px 2px 0; overscroll-behavior: contain; }
+.msg { display: flex; gap: 10px; align-items: flex-start; min-width: 0; }
+.msg.learner { justify-content: flex-end; }
 .msg .avatar { width: 30px; height: 30px; border-radius: 50%; flex: none; display: grid; place-items: center; font-size: 12px; font-family: var(--jp); }
 .msg.tutor .avatar { background: var(--ai-soft); color: #cfdaff; border: 1px solid rgba(91,124,250,.4); }
-.msg.learner .avatar { background: var(--shu-soft); color: #ffd0cc; border: 1px solid rgba(226,87,76,.4); }
+.msg.learner .avatar { order: 2; background: var(--shu-soft); color: #ffd0cc; border: 1px solid rgba(226,87,76,.4); }
 .msg .bubble {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 11px 14px;
-  font-family: var(--jp); font-size: 17px; line-height: 1.8; max-width: 78%;
+  min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 11px 14px;
+  font-family: var(--jp); font-size: 17px; line-height: 1.8; max-width: 78%; overflow-wrap: anywhere;
 }
 .msg.learner .bubble { background: var(--bg-2); }
-.msg .bubble .en { font-family: var(--ui); font-size: 12.5px; color: var(--ink-3); font-family: var(--ui); }
+.msg.learner .bubble { border-color: rgba(226,87,76,.18); }
+.msg .bubble .en { font-family: var(--ui); font-size: 12.5px; color: var(--ink-3); }
 .composer { display: flex; gap: 9px; align-items: flex-end; margin-top: 14px; }
-.composer textarea { min-height: 54px; max-height: 160px; font-family: var(--jp); font-size: 17px; }
+.composer textarea { flex: 1 1 auto; min-width: 0; min-height: 54px; max-height: 160px; font-family: var(--jp); font-size: 17px; }
 .micbtn { width: 46px; height: 46px; border-radius: 50%; border: 1px solid rgba(226,87,76,.45); background: var(--shu-soft); color: #ffd0cc; display: grid; place-items: center; cursor: pointer; flex: none; }
 .micbtn.rec { background: var(--shu-deep); color: #fff; animation: pulse 1.3s infinite; }
+@media (max-width: 680px) {
+  .scenario-roles { grid-template-columns: 1fr; }
+  .scenario-goal { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .chat { max-height: none; }
+  .msg .bubble { max-width: calc(100% - 40px); font-size: 16px; }
+  .composer { gap: 6px; }
+  .composer .primary { padding-left: 12px; padding-right: 12px; }
+}
 @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(226,87,76,.5); } 50% { box-shadow: 0 0 0 10px rgba(226,87,76,0); } }
 
 /* feedback blocks */
@@ -357,10 +378,18 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(91,124,250,.
 .beats li.active .bicon { background: var(--shu-soft); color: #ffd0cc; }
 .beats .btitle { font-weight: 550; }
 .beats .bmeta { font-size: 11.5px; color: var(--ink-3); }
-.stage { min-height: 300px; }
+.stage { min-height: 300px; min-width: 0; }
 .stage-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
-.stage-head h2 { font-family: var(--jp); margin-bottom: 2px; }
-.beat-tools { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
+.stage-head > div:first-child { min-width: 0; }
+.stage-head h2 { font-family: var(--jp); margin-bottom: 2px; overflow-wrap: anywhere; }
+.beat-tools { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
+.debrief-loading { min-height: 170px; display: flex; flex-direction: column; justify-content: center; }
+.debrief-error { border-color: rgba(239,107,107,.4); }
+@media (max-width: 680px) {
+  .stage-head { flex-direction: column; }
+  .beat-tools { width: 100%; justify-content: flex-start; }
+  .beat-tools .primary { flex: 1 1 auto; }
+}
 .ratings { display: flex; gap: 7px; flex-wrap: wrap; margin: 16px 0 4px; }
 .ratings button { font-size: 12px; padding: 6px 11px; }
 .hint {
