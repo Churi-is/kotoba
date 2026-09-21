@@ -10,7 +10,7 @@
 
 import type { Beat, Env, Feedback, LearnerModel, Profile, SessionPlan } from '../types';
 import {
-  MODEL_FOR, callJSON, callModel, hasKey, ModelOutputError, type ModelResult, liveSetup, LIVE_TOOLS,
+  MODEL_FOR, callJSON, callModel, hasKey, ModelCallError, ModelOutputError, type ModelResult, liveSetup, LIVE_TOOLS,
 } from './gemini';
 import {
   TUTOR_PERSONA, PLAN_SCHEMA, PLACEMENT_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, turnSystemPrompt, turnUserPrompt,
@@ -40,6 +40,9 @@ export interface BrainMeta {
   model: string;
   transport: string;
   ms: number;
+  /** Server-side conversation handle. Pass it back on the next turn and the model
+   *  already knows what was said; the API keeps the history, we keep the id. */
+  interactionId?: string;
 }
 
 export interface TurnResult { text: string; note?: string; meta: BrainMeta }
@@ -90,7 +93,7 @@ class GeminiBrain implements TutorBrain {
   async planSession(req: PlanRequest): Promise<PlanResult> {
     const input = plannerPrompt(req) + '\n\n' + curriculumDigest(req.model.overall.cefr);
     const res = await callJSON<any>(this.env, {
-      model: this.m('planner'), system: TUTOR_PERSONA, input, schema: PLAN_SCHEMA, temperature: 0.85,
+      model: this.m('planner'), system: TUTOR_PERSONA, input, schema: PLAN_SCHEMA, thinking: 'deep',
     });
     let plan = normalizePlan(res.json, req, res.model);
     let designNote = '';
@@ -101,7 +104,7 @@ class GeminiBrain implements TutorBrain {
     if (problems.length) {
       const repair = await callJSON<any>(this.env, {
         model: this.m('planner'), system: TUTOR_PERSONA,
-        input: planRepairPrompt(JSON.stringify(plan), problems, req), schema: PLAN_SCHEMA, temperature: 0.3,
+        input: planRepairPrompt(JSON.stringify(plan), problems, req), schema: PLAN_SCHEMA, thinking: 'balanced',
       });
       const repaired = normalizePlan(repair.json, req, repair.model);
       const valid = repaired.beats.filter((b) => validateBeat(b).ok);
@@ -119,14 +122,33 @@ class GeminiBrain implements TutorBrain {
   }
 
   async converse(a: Parameters<TutorBrain['converse']>[0]): Promise<TurnResult> {
-    const res = await callModel(this.env, {
+    const turn = {
       model: this.m('tutor'),
       system: turnSystemPrompt(a.profile, a.model, a.beat, a.plan),
-      input: turnUserPrompt(a.history, a.learnerText),
-      previousInteractionId: a.interactionId,
-      temperature: 0.9,
-      maxOutputTokens: 400,
-    });
+      thinking: 'balanced' as const,
+      // Generous next to the 1–3 sentences we ask for, because max_output_tokens pays
+      // for thoughts *and* answer — a tight ceiling here truncates the tutor mid-word.
+      maxOutputTokens: 2048,
+    };
+    // Server-side state (previous_interaction_id) is an optimisation, never a single
+    // point of failure: the interaction may have aged out or the id may belong to a
+    // different learner, and a dead tutor mid-lesson is worse than a re-sent history.
+    // With a valid id we send only the new line; the model already has the rest.
+    let res: ModelResult;
+    if (a.interactionId) {
+      try {
+        res = await callModel(this.env, {
+          ...turn,
+          input: turnUserPrompt(a.history, a.learnerText, { skipHistory: true }),
+          previousInteractionId: a.interactionId,
+        });
+      } catch (err) {
+        if (!(err instanceof ModelCallError)) throw err;
+        res = await callModel(this.env, { ...turn, input: turnUserPrompt(a.history, a.learnerText) });
+      }
+    } else {
+      res = await callModel(this.env, { ...turn, input: turnUserPrompt(a.history, a.learnerText) });
+    }
     const [main, noteLine] = res.text.split(/\n?NOTE:/);
     return {
       text: (main ?? '').trim() || 'すみません、もう一度 お願いします。',
@@ -139,7 +161,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: feedbackPrompt({ ...a, model: a.model ?? a.model, timing: a.profile.style.correctionTiming } as any),
-      schema: FEEDBACK_SCHEMA, temperature: 0.4,
+      schema: FEEDBACK_SCHEMA, thinking: 'balanced',
     });
     return { feedback: normalizeFeedback(res.json, a.beat, a.model?.overall?.cefr ?? 'A2'), meta: metaOf(res) };
   }
@@ -148,7 +170,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: `Mark this piece of writing against its rubric.\n\nPROMPT: ${a.beat.openEnded?.promptJA}\nRUBRIC: ${JSON.stringify(a.beat.openEnded?.rubric)}\nLEARNER LEVEL: ${a.level}\nLEARNER WROTE:\n${a.text}\n\nMarking rules: judge task achievement first, then range, accuracy, cohesion. Maximum 3 notices, each with an \`elicit\` question in Japanese that would let them self-correct. Quote their own words in wins. Do not correct errors above their level that they could not plausibly know.\n\nReturn JSON matching the feedback schema.`,
-      schema: FEEDBACK_SCHEMA, temperature: 0.3,
+      schema: FEEDBACK_SCHEMA, thinking: 'balanced',
     });
     return { feedback: normalizeFeedback(res.json, a.beat, a.level), meta: metaOf(res) };
   }
@@ -157,7 +179,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: debriefPrompt(a.plan, a.transcript, a.profile.style.correctionTiming),
-      temperature: 0.6,
+      thinking: 'balanced',
     });
     return { debrief: normalizeDebrief(res.json), meta: metaOf(res) };
   }
@@ -170,7 +192,7 @@ class GeminiBrain implements TutorBrain {
       // noisiest input in the app while the learner watches a spinner. Without the schema
       // the pro model writes a tutor's essay, and the parser meets prose, not JSON.
       schema: PLACEMENT_SCHEMA,
-      temperature: 0.3,
+      thinking: 'deep',
     });
     const j = res.json as any;
     return {
@@ -185,19 +207,19 @@ class GeminiBrain implements TutorBrain {
   }
 
   async gloss(a: Parameters<TutorBrain['gloss']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('fast'), input: glossPrompt(a.term, a.context, a.level), temperature: 0.2 });
+    const res = await callJSON<any>(this.env, { model: this.m('fast'), input: glossPrompt(a.term, a.context, a.level), thinking: 'bulk' });
     const j = res.json as any;
     return { reading: j.reading ?? '', meaningEN: j.meaningEN ?? '', pos: j.pos ?? '', note: j.note ?? '', example: j.example ?? '', exampleEN: j.exampleEN ?? '', meta: metaOf(res) };
   }
 
   async story(a: Parameters<TutorBrain['story']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: storyPrompt(a), temperature: 0.95 });
+    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: storyPrompt(a), thinking: 'balanced' });
     const j = res.json as any;
     return { titleJA: j.titleJA, titleEN: j.titleEN, text: j.text, glossary: j.glossary ?? [], hook: j.hook ?? '', question: j.question ?? { prompt: '', options: [], answer: '', explanation: '' }, meta: metaOf(res) };
   }
 
   async register(a: Parameters<TutorBrain['register']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: registerPrompt(a.content, a.registers), temperature: 0.3 });
+    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: registerPrompt(a.content, a.registers), thinking: 'balanced' });
     const j = res.json as any;
     return { items: j.items ?? [], meta: metaOf(res) };
   }
@@ -220,7 +242,7 @@ Rules:
 - "replan" if the whole approach is mismatched (too hard, too easy, the learner asked).
 - "wrap" if time is short or they are clearly fatigued (short answers, many skips, "too hard" twice).
 Answer in JSON: {action, reason (one sentence, no jargon), injectKinds?}`,
-      temperature: 0.2,
+      thinking: 'bulk',
     });
     const j = res.json as any;
     const action = ['continue', 'inject', 'replan', 'wrap'].includes(j?.action) ? j.action : 'continue';
@@ -231,7 +253,7 @@ Answer in JSON: {action, reason (one sentence, no jargon), injectKinds?}`,
     const res = await callJSON<any>(this.env, {
       model: this.m('fast'),
       input: `Rewrite this Japanese passage so that a ${a.level} learner reading at 96% known-vocabulary coverage can understand it. Keep the same information and roughly the same length. Only these words may be new to them: up to ${a.allowedNew} items. Prefer simpler syntax over shorter text: split complex clauses, use high-frequency connectives, keep naturalness.\n\nPASSAGE:\n${a.text}\n\nTheir known vocabulary sample: ${a.knownWords.slice(0, 60).join('、')}\n\nReturn JSON {text} only.`,
-      temperature: 0.3,
+      thinking: 'bulk',
     });
     return { text: (res.json as any)?.text ?? a.text, meta: metaOf(res) };
   }
@@ -256,7 +278,7 @@ export function getBrain(env: Env): TutorBrain {
 // ------------------------------------------------------------------ normalisation
 
 function metaOf(res: ModelResult): BrainMeta {
-  return { kind: 'gemini', model: res.model, transport: res.transport, ms: res.ms };
+  return { kind: 'gemini', model: res.model, transport: res.transport, ms: res.ms, interactionId: res.interactionId };
 }
 
 export function normalizePlan(j: any, req: PlanRequest, model: string): SessionPlan {
@@ -374,5 +396,7 @@ export function liveSessionConfig(env: Env, systemInstruction: string, deep = fa
     systemInstruction,
     tools: LIVE_TOOLS,
     resumptionHandle,
+    // The extended-thinking model requires a level; the others reject one outright.
+    thinking: deep ? 'high' : 'low',
   });
 }

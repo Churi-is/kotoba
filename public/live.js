@@ -67,6 +67,12 @@ export async function startVoiceSession({ wsPath, model, onTutor, onLearner, onS
     try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : await blobText(ev.data)); } catch { return; }
     switch (msg.type) {
       case 'ready': state('live'); break;
+      case 'interaction_status':
+        // Extended-thinking sessions reason in the background between utterances;
+        // IDLE is the only state where Aoi is actually waiting for the learner.
+        if (msg.status === 'IDLE') state('live');
+        else if (msg.status === 'IN_PROGRESS') state('thinking…');
+        break;
       case 'audio': enqueue(msg.data, msg.mimeType); break;
       case 'tutor_transcript': onTutor?.(msg.text); break;
       case 'learner_transcript': onLearner?.(msg.text); break;

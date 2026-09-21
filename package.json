@@ -10,6 +10,8 @@
     "types": "wrangler types",
     "tail": "wrangler tail",
     "check": "tsc --noEmit",
+    "check:shapes": "node --experimental-strip-types tools/shape-check.mjs",
+    "smoke": "node tools/gemini-smoke.mjs",
     "shots": "node tools/shots.mjs",
     "audit": "node tools/audit.mjs",
     "audit:mobile": "node tools/audit.mjs --mobile",

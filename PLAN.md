@@ -335,11 +335,23 @@ tomorrow-preview, gloss/story/register tools, tutor Q&A, and every SPA asset.
 Live WebSocket relay, TTS, and ephemeral-token direct mode. They are written against
 the documented shapes, with tolerant parsing because the response envelopes have moved
 across versions, but *no key existed in this sandbox to prove them.* Treat the first
-keyed run as a test, not a launch.
+keyed run as a test, not a launch — `GEMINI_API_KEY=… node tools/gemini-smoke.mjs`
+is that test, and it exercises every call shape including one deliberately-wrong
+request so the failure modes are visible rather than theoretical.
+
+The shapes were re-checked against the live documentation on 2026-09-21 after a run of
+`400 invalid_request` errors; the API had removed the fields this code was sending
+(`response_schema`, `response_mime_type`, `temperature`), `system` was being dropped on
+the floor, and the Live socket turned out to be per-model on thinking: the
+extended-thinking model *requires* a thinking level and `behavior: NON_BLOCKING` on its
+tool declarations, while plain `gemini-3.8-live` rejects any thinking config — and in a
+thinking session it is `interactionStatus` (`IDLE` / `IN_PROGRESS`), not `turnComplete`,
+that says the session is idle. **[docs/gemini-api.md](./docs/gemini-api.md) is the
+reference; the corrections are in `src/ai/gemini.ts`.** `npm run check:shapes` asserts
+the wire shapes offline; the smoke script below asserts them against the real API.
 
 **Known gaps**: `liveSessionConfig` and `validateBeat` are imported but unused in the
-worker entry; `LiveSessionDO` carries a local `setupFrame()` that should be collapsed
-into `gemini.ts`; the HTTP-level Durable Object reset alarm (auto-resolving stale
+worker entry; the HTTP-level Durable Object reset alarm (auto-resolving stale
 errors after 21–30 days) has not been observed firing, only its logic exercised.
 
 **One thing the browser found that the tests could not.** A learner who answered one

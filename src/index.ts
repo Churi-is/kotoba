@@ -517,7 +517,7 @@ app.post('/api/session/:id/turn', async (c) => {
   if (turn.note) await l.addNote(turn.note, id);
   await l.kvPut(`session:${id}`, s);
 
-  return Response.json({ reply: turn.text, meta: turn.meta, interactionId: (turn.meta as any).interactionId });
+  return Response.json({ reply: turn.text, meta: turn.meta, interactionId: turn.meta.interactionId });
 });
 
 app.post('/api/session/:id/beat/:beatId/mark', async (c) => {
@@ -707,7 +707,9 @@ app.post('/api/live/start', async (c) => {
   let direct: any = null;
   if (wantDirect) {
     try {
-      direct = await createEphemeralToken(c.env, { model: MODEL_FOR(c.env, deep ? 'liveDeep' : 'live'), systemInstruction, minutes: 30 });
+      // The token itself is bound to no setup; whoever holds it sends its own setup
+      // message over the *Constrained* endpoint (see gemini.createEphemeralToken).
+      direct = await createEphemeralToken(c.env, { minutes: 30 });
     } catch { direct = null; }
   }
 
