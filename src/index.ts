@@ -6,13 +6,14 @@
  *
  * The Worker itself is stateless glue: auth, validation, prompts, and cost control.
  * All learner memory lives in the Durable Object. Everything the model does goes
- * through a TutorBrain so it degrades to the scripted tutor instead of failing.
+ * through a TutorBrain — and when no model can be reached, the answer is an honest,
+ * actionable error (503 not configured / 502 model failure), never scripted content.
  */
 
 import { Hono } from 'hono';
 import type { Beat, BeatEvent, Env, Profile, SessionPlan, SessionSummary, Target } from './types';
-import { getBrain, resilient, liveSessionConfig } from './ai/brain';
-import { MODEL_FOR, createEphemeralToken, synthesize, hasKey } from './ai/gemini';
+import { getBrain, liveSessionConfig, ModelConfigError, AI_SETUP_MESSAGE, type TutorBrain } from './ai/brain';
+import { MODEL_FOR, ModelCallError, ModelOutputError, createEphemeralToken, synthesize, hasKey } from './ai/gemini';
 import { TOOLS, TOOL_BY_KIND, validateBeat } from './domain/tasks';
 import {
   PLACEMENT_STAGES, buildBank, collectEvidence, emptyProfile, placementEvidenceSummary,
@@ -22,9 +23,9 @@ import {
 import {
   CANDO, VOCAB, KANJI, GRAMMAR, SCENARIOS,
 } from './content/seed';
-import { mockPlacement } from './ai/mock';
+import { evidenceSeedModel } from './domain/learner-model';
+import { buildQuizBeat, buildGrammarBeat, buildShadowingBeat } from './domain/templates';
 import { cefrIndex, pickRecipe, targetLanguageRatio, estimateCoverage, errorTag } from './domain/pedagogy';
-import { buildQuizBeat, buildGrammarBeat, buildShadowingBeat } from './ai/mock';
 import type { LearnerStub, LiveStub } from './runtime/index';
 
 export { LearnerDO } from './runtime/learner';
@@ -63,7 +64,6 @@ function parseCookies(header: string | null): Record<string, string> {
 app.use('/api/*', async (c, next) => {
   const cookies = parseCookies(c.req.header('cookie') ?? null);
   let id = '';
-  let setCookie = '';
   const raw = cookies['kt'];
   if (raw?.includes('.')) {
     const [candidate, sig] = raw.split('.');
@@ -76,28 +76,53 @@ app.use('/api/*', async (c, next) => {
     const provided = c.req.header('x-kotoba-learner') ?? c.req.query('learner');
     if (provided && /^L[0-9a-f]{16,32}$/.test(provided)) id = provided;
   }
+  let newCookie = '';
   if (!id) {
     id = `L${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    setCookie = `kt=${id}.${await sign(c.env, id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`;
+    newCookie = `kt=${id}.${await sign(c.env, id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`;
+    // Pre-headers survive into onError responses (which are built with c.json), so an
+    // error never costs the learner their identity cookie…
+    c.header('set-cookie', newCookie, { append: true });
   }
   c.set('learnerId', id);
   await next();
-  if (setCookie) c.res.headers.append('set-cookie', setCookie);
+  // …but most handlers return raw `Response.json(...)` objects, which do not carry
+  // pre-headers. Merge the cookie after the fact for those, without doubling it up.
+  if (newCookie && !c.res.headers.get('set-cookie')) c.res.headers.append('set-cookie', newCookie);
 });
 
 function learner(env: Env, id: string): LearnerStub {
   return env.LEARNER.get(env.LEARNER.idFromName(id)) as unknown as LearnerStub;
 }
 
-function brainFor(c: any) {
-  const events: string[] = [];
-  const b = resilient(c.env, getBrain(c.env), (e) => events.push(e.message));
-  return { brain: b, errors: events };
+/** The one way handlers get the tutor. Throws ModelConfigError when no key is
+ *  configured — onError below turns that into an actionable 503. */
+function brain(c: any): TutorBrain {
+  return getBrain(c.env);
 }
 
 function bad(message: string, status = 400) {
   return Response.json({ error: message }, { status });
 }
+
+/**
+ * Error taxonomy for the whole API:
+ *   503 ai_not_configured  → no model key / AI Gateway; the message says how to fix it
+ *   502 ai_call_failed     → the model API itself errored (bad key, outage, quota)
+ *   502 ai_output_invalid  → the model answered but produced unusable output twice
+ *   500 internal           → everything else
+ * The client shows `message` verbatim, so these are written for a person, not a log.
+ */
+app.onError((err, c) => {
+  if (err instanceof ModelConfigError) {
+    return c.json({ error: err.code, message: err.message }, 503);
+  }
+  if (err instanceof ModelCallError || err instanceof ModelOutputError) {
+    return c.json({ error: err.code, message: err.message }, 502);
+  }
+  console.error('unhandled', err);
+  return c.json({ error: 'internal', message: (err as Error)?.message ?? 'something broke' }, 500);
+});
 
 // ------------------------------------------------------------------ health + config
 
@@ -239,12 +264,14 @@ app.post('/api/placement/stage', async (c) => {
     case 'interview': st.responses.interview = payload; break;  // {score, turns, transcript}
     case 'speaking': {
       // Speaking is marked by the model against the probes, not by us.
-      const { brain } = brainFor(c);
-      const fb = await brain.markBeat({
+      const profile = await l.getProfile();
+      const fb = await brain(c).markBeat({
         plan: { id: 'placement', titleEN: 'Placement interview', titleJA: '面接', theme: '', rationale: '', canDo: [], recipeId: 'placement', mode: 'voice', totalMinutes: 5, beats: [], focusErrorTags: [], reviewCardIds: [], createdAt: Date.now(), designedBy: '' },
         beat: { id: 'sp', kind: 'roleplay', minutes: 5, titleJA: '話す', titleEN: 'Speaking probe', objective: 'Assess intelligibility, fluency and range', why: '', targets: [], success: '', difficulty: 3, scaffolding: [], mode: 'voice' },
-        profile: await l.getProfile(),
-        model: (await l.getModel()) ?? mockPlacement(await l.getProfile(), {}),
+        profile,
+        // No learner model exists yet during placement — the marking prompt gets the
+        // neutral numeric seed purely as context, never as stored state.
+        model: (await l.getModel()) ?? evidenceSeedModel(profile, {}),
         transcript: (payload?.turns ?? []).map((t: any) => ({ role: t.role, text: t.text })),
       });
       st.responses.speaking = {
@@ -269,7 +296,6 @@ app.get('/api/placement/state', async (c) => {
 app.post('/api/placement/finish', async (c) => {
   const l = learner(c.env, c.get('learnerId'));
   const st = (await l.kvGet<any>('placement')) ?? { responses: {} };
-  const { brain } = brainFor(c);
   const r = st.responses ?? {};
 
   const profile = await l.saveProfile({
@@ -317,7 +343,7 @@ app.post('/api/placement/finish', async (c) => {
   r.grammar = { state: st.responses?.grammar?.state };
   r.__skipped = st.skipped ?? [];
   const evidence = collectEvidence(r);
-  const synth = await brain.synthesizePlacement({ profile, evidence });
+  const synth = await brain(c).synthesizePlacement({ profile, evidence });
   await l.saveModel(synth.model);
   for (const n of synth.notes ?? []) await l.addNote(n);
   await l.seedCanDo(CANDO.map((c2) => ({ id: c2.id, level: c2.level, skill: c2.skill, statement: c2.statement })));
@@ -361,7 +387,7 @@ app.post('/api/session/start', async (c) => {
     : undefined;
   const recipe = pickRecipe(ctx.model, minutes, body.goalHint as any, deadlineDays);
 
-  const { brain, errors } = brainFor(c);
+  const tutor = brain(c);
   const reqObj = {
     profile, model: ctx.model, recipeId: recipe.id, recipeShape: recipe.shape as any,
     minutes, mode: mode as 'voice' | 'text', goalHint: body.goalHint,
@@ -369,7 +395,7 @@ app.post('/api/session/start', async (c) => {
     recentNotices: ctx.recentNotices, sessionNumber: ctx.sessionNumber, lastSummary: ctx.lastSummary,
   };
 
-  const { plan, meta } = await brain.planSession(reqObj);
+  const { plan, meta } = await tutor.planSession(reqObj);
 
   // Comprehensible-input gate: generated passages must sit in the 95–98% band.
   const knownSet = new Set((await l.dueCards(200)).map((d) => d.surface));
@@ -378,7 +404,7 @@ app.post('/api/session/start', async (c) => {
       const cov = estimateCoverage(b.reading.text, (t) => knownSet.has(t) || t.length <= 1);
       const target = cefrIndex(ctx.model.overall.cefr) < 3 ? 0.95 : 0.96;
       if (cov.coverage < target - 0.06) {
-        const sim = await brain.simplify({
+        const sim = await tutor.simplify({
           text: b.reading.text, level: ctx.model.overall.cefr,
           knownWords: [...knownSet].slice(0, 80), allowedNew: 3,
         });
@@ -388,7 +414,6 @@ app.post('/api/session/start', async (c) => {
     }
   }
 
-  if (meta.degraded) await l.addNote(`Model degraded during planning: ${errors.join('; ').slice(0, 120)}`);
   const cardInfo = await l.addCards(plan.beats.flatMap((b) => b.targets).slice(0, 12), ctx.model.overall.cefr);
   await l.startSession(plan, mode);
   await l.kvPut(`session:${plan.id}`, { plan, events: [], started: Date.now(), mode });
@@ -419,16 +444,25 @@ app.post('/api/session/:id/event', async (c) => {
     || (e.type === 'beat_complete')
     || (e.type === 'skip');
   let adaptation: { action: string; reason: string; beat?: Beat } | null = null;
+  let adaptationError: string | undefined;
 
   if (signal) {
     const model = await l.getModel();
-    const { brain } = brainFor(c);
-    const decision = await brain.adapt({
-      plan: s.plan, beatIndex: Math.max(0, s.plan.beats.findIndex((b: Beat) => b.id === e.beatId)),
-      profile: await l.getProfile(), model: model as any,
-      recent: (s.events ?? []).slice(-14).map((x: any) => ({ type: x.type, payload: x.payload })),
-    });
-    if (decision.action === 'inject') {
+    // The event above is already logged — an adaptation failure must report itself
+    // without taking the learner's evidence down with it.
+    let decision: any = null;
+    try {
+      decision = await brain(c).adapt({
+        plan: s.plan, beatIndex: Math.max(0, s.plan.beats.findIndex((b: Beat) => b.id === e.beatId)),
+        profile: await l.getProfile(), model: model as any,
+        recent: (s.events ?? []).slice(-14).map((x: any) => ({ type: x.type, payload: x.payload })),
+      });
+    } catch (err) {
+      adaptationError = (err as Error).message;
+    }
+    if (!decision) {
+      // reported to the client as adaptationError; the session simply stays on plan
+    } else if (decision.action === 'inject') {
       // The app supplies the drill; the model decided it was needed. Injected beats are
       // built from validated templates so a live lesson can never break.
       const tag = (model?.errorProfile ?? []).find((x) => !x.resolved)?.tag ?? 'particle.wa_ga';
@@ -453,7 +487,7 @@ app.post('/api/session/:id/event', async (c) => {
     }
   }
   await l.kvPut(`session:${id}`, s);
-  return Response.json({ ok: true, adaptation });
+  return Response.json({ ok: true, adaptation, ...(adaptationError ? { adaptationError } : {}) });
 });
 
 app.post('/api/session/:id/turn', async (c) => {
@@ -469,9 +503,8 @@ app.post('/api/session/:id/turn', async (c) => {
     .filter((e: any) => e.beatId === beatId && (e.type === 'utterance' || e.type === 'tutor_line'))
     .map((e: any) => ({ role: e.type === 'utterance' ? 'learner' : 'tutor', text: String(e.payload.text ?? '') }));
 
-  const { brain, errors } = brainFor(c);
   const model = await l.getModel();
-  const turn = await brain.converse({
+  const turn = await brain(c).converse({
     plan: s.plan, beat, history, learnerText: text,
     profile: await l.getProfile(), model: model as any, interactionId,
   });
@@ -483,7 +516,6 @@ app.post('/api/session/:id/turn', async (c) => {
     { ts: Date.now(), beatId, type: 'tutor_line', payload: { text: turn.text } }];
   if (turn.note) await l.addNote(turn.note, id);
   await l.kvPut(`session:${id}`, s);
-  if (errors.length) await l.addNote(`model degraded mid-conversation: ${errors[0].slice(0, 100)}`, id);
 
   return Response.json({ reply: turn.text, meta: turn.meta, interactionId: (turn.meta as any).interactionId });
 });
@@ -502,13 +534,12 @@ app.post('/api/session/:id/beat/:beatId/mark', async (c) => {
     .filter((e: any) => e.beatId === beatId && (e.type === 'utterance' || e.type === 'tutor_line'))
     .map((e: any) => ({ role: e.type === 'utterance' ? 'learner' : 'tutor', text: String(e.payload.text ?? '') }));
 
-  const { brain } = brainFor(c);
   const profile = await l.getProfile();
   const model = await l.getModel();
 
   const { feedback } = beat.kind === 'open_ended' && body.text
-    ? await brain.gradeOpen({ beat, text: body.text, level: model?.overall.cefr ?? 'A2', profile })
-    : await brain.markBeat({ plan: s.plan, beat, profile, model: model as any, transcript, answers: body.answers });
+    ? await brain(c).gradeOpen({ beat, text: body.text, level: model?.overall.cefr ?? 'A2', profile })
+    : await brain(c).markBeat({ plan: s.plan, beat, profile, model: model as any, transcript, answers: body.answers });
 
   await l.applyFeedback(feedback, id, beatId);
   await l.logEvent(id, { ts: Date.now(), beatId, type: 'rating', payload: { value: 'marked', notices: feedback.notices.length } });
@@ -530,8 +561,7 @@ app.post('/api/session/:id/finish', async (c) => {
   }, { answered: 0, correct: 0, spokenTurns: 0, writtenTurns: 0, hintUses: 0, skipped: 0 });
 
   const transcript = (s.events ?? []).map((e: any) => ({ role: e.type === 'utterance' ? 'learner' : 'tutor', text: String(e.payload?.text ?? '') })).filter((t: any) => t.text);
-  const { brain } = brainFor(c);
-  const { debrief } = await brain.debrief({ plan: s.plan, transcript, profile: await l.getProfile(), model: (await l.getModel()) as any });
+  const { debrief } = await brain(c).debrief({ plan: s.plan, transcript, profile: await l.getProfile(), model: (await l.getModel()) as any });
 
   for (const c2 of debrief.newCards ?? []) {
     await l.addCards([{ kind: 'vocab', surface: c2.surface, reading: c2.reading, meaning: c2.meaning }], 'session');
@@ -575,8 +605,7 @@ app.post('/api/tools/gloss', async (c) => {
   const cacheKey = `gloss:${term}`;
   const cached = await l.kvGet<any>(cacheKey);
   if (cached) return Response.json({ ...cached, cached: true });
-  const { brain } = brainFor(c);
-  const g = await brain.gloss({ term, context: context ?? '', level: model?.overall.cefr ?? 'A2' });
+  const g = await brain(c).gloss({ term, context: context ?? '', level: model?.overall.cefr ?? 'A2' });
   await l.kvPut(cacheKey, g);
   return Response.json(g);
 });
@@ -593,8 +622,7 @@ app.post('/api/tools/story', async (c) => {
   const { episode, previous } = await c.req.json<{ episode?: number; previous?: string }>().catch(() => ({} as any));
   const l = learner(c.env, c.get('learnerId'));
   const ctx = await l.planContext();
-  const { brain } = brainFor(c);
-  const s = await brain.story({
+  const s = await brain(c).story({
     episode: episode ?? ((await l.kvGet<number>('storyEpisode')) ?? 0) + 1,
     level: ctx.model?.overall.cefr ?? 'A2',
     dueItems: ctx.dueCards.slice(0, 8).map((d) => d.surface),
@@ -609,8 +637,7 @@ app.post('/api/tools/register', async (c) => {
   const { content, registers } = await c.req.json<{ content: string; registers?: string[] }>();
   const l = learner(c.env, c.get('learnerId'));
   const ctx = await l.planContext();
-  const { brain } = brainFor(c);
-  const r = await brain.register({
+  const r = await brain(c).register({
     content,
     registers: registers ?? (cefrIndex(ctx.model?.overall.cefr ?? 'A2') < 4 ? ['casual', 'polite'] : ['casual', 'polite', 'honorific', 'humble']),
   });
@@ -625,23 +652,7 @@ app.post('/api/tutor/ask', async (c) => {
   if (!d.model) return bad('no learner model yet', 409);
 
   const topErrors = d.errors.slice(0, 5).map((e) => `${errorTag(e.tag).label} ×${e.count}`).join(', ');
-  const { brain } = brainFor(c);
-
-  // The scripted tutor answers meta-questions from the model directly rather than
-  // improvising a conversation turn — it is a report, and pretending otherwise
-  // would be worse than admitting the limit.
-  if (brain.kind === 'mock') {
-    const m = d.model;
-    const lines = [
-      `Your model says: overall ${m.overall.cefr}${m.overall.jlptEstimate !== 'none' ? ` (JLPT-ish ${m.overall.jlptEstimate})` : ''}, with speaking ${m.skills.speaking.cefr} and reading ${m.skills.reading.cefr}.`,
-      topErrors ? `Recurring error patterns, most frequent first: ${topErrors}. Those are what the planner targets — not the textbook's order.` : 'No error patterns logged yet: produce some language and I will start finding them.',
-      `Deck: ${d.deck.total} cards, ${d.deck.mature ?? 0} mature. Sessions so far: ${m.streaks.totalSessions} (${m.streaks.totalMinutes} minutes).`,
-      `Reading ${m.metrics.readingWPM} wpm; listening at native speed ${Math.round((m.metrics.listeningAccuracyAtNativeSpeed ?? 0) * 100)}%; you code-switch to English in about ${Math.round((m.metrics.codeSwitchRate ?? 0) * 100)}% of turns.`,
-      'This answer is assembled from your stored evidence by the scripted tutor. Configure a model key and the same question gets a judgement, not a summary.',
-    ];
-    return Response.json({ answer: lines.join('\n\n'), meta: { kind: 'mock', model: 'scripted' } });
-  }
-  const answer = await brain.converse({
+  const answer = await brain(c).converse({
     plan: { id: 'ask', titleEN: 'Tutor Q&A', titleJA: '質問', theme: '', rationale: '', canDo: [], recipeId: 'ask', mode: 'text', totalMinutes: 2, beats: [], focusErrorTags: [], reviewCardIds: [], createdAt: Date.now(), designedBy: '' },
     beat: {
       id: 'ask', kind: 'free_talk', minutes: 2, titleJA: '質問', titleEN: 'About your learning',
@@ -663,6 +674,8 @@ app.post('/api/tutor/ask', async (c) => {
 
 app.post('/api/live/start', async (c) => {
   const { sessionId, beatId, deep } = await c.req.json<{ sessionId?: string; beatId?: string; deep?: boolean }>();
+  // Voice runs on the Live API only; without a key there is no voice session at all.
+  if (!hasKey(c.env)) throw new ModelConfigError('Voice mode needs a model key. ' + AI_SETUP_MESSAGE);
   const l = learner(c.env, c.get('learnerId'));
   const ctx = await l.planContext();
   const s = sessionId ? await l.kvGet<any>(`session:${sessionId}`) : null;
@@ -690,7 +703,7 @@ app.post('/api/live/start', async (c) => {
 
   // Two ways to talk to the model. `relay` keeps the transcript + tool calls server-side
   // (default). `direct` hands the browser an ephemeral token for the lowest latency.
-  const wantDirect = c.req.query('direct') === '1' && hasKey(c.env);
+  const wantDirect = c.req.query('direct') === '1';
   let direct: any = null;
   if (wantDirect) {
     try {

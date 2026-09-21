@@ -45,7 +45,7 @@
   },
 
   "vars": {
-    "AI_MODE": "auto",                       // auto | gemini | mock
+    "AI_MODE": "auto",                       // auto | gemini — a model key is required either way (no scripted mode)
     "GEMINI_BASE": "https://generativelanguage.googleapis.com/v1beta",
     "MODEL_PLANNER": "gemini-3.1-pro-preview", // deep design work: plans, placement synthesis, weekly reviews
     "MODEL_TUTOR": "gemini-3.8-flash",         // in-session turns, feedback, item generation
@@ -59,7 +59,7 @@
 
   "env": {
     "staging": {
-      "vars": { "AI_MODE": "mock" }
+      "vars": { "AI_MODE": "auto" }
     }
   }
 }

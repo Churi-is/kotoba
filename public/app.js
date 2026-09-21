@@ -50,15 +50,15 @@ function banner() {
   const b = $('#banner');
   const h = state.health;
   if (!h) return;
-  if (!h.modelKey || state.model?.notes?.some((n) => n.includes('Scripted'))) {
-    b.className = 'banner warn';
+  if (!h.modelKey) {
+    b.className = 'banner bad';
     b.replaceChildren(
       ICON('info'),
       // Two texts, one shown per viewport: on a phone the long version pushed the
       // actual lesson six lines down the screen.
-      el('span', { class: 'grow banner-long', text: 'Scripted tutor mode — no Gemini key configured. Everything works (placement, sessions, marking, SRS) using deterministic templates. Add GEMINI_API_KEY (or an AI Gateway) and the real tutor takes over with no other changes.' }),
-      el('span', { class: 'grow banner-short', text: 'Scripted tutor — no model key. Everything works; it is just not the real thing.' }),
-      el('button', { class: 'ghost small', onclick: showStatus }, 'how to enable'),
+      el('span', { class: 'grow banner-long', text: 'The tutor cannot run: no Gemini key is configured on the server, and there is no scripted fallback. Placement, sessions, marking and review all need the model. Add GEMINI_API_KEY (or an AI Gateway) and redeploy.' }),
+      el('span', { class: 'grow banner-short', text: 'Tutor not configured — the app needs a Gemini key to run.' }),
+      el('button', { class: 'ghost small', onclick: showStatus }, 'how to fix'),
     );
   } else {
     b.className = 'banner hidden';
@@ -95,7 +95,7 @@ function showStatus() {
     el('dl', { class: 'kv' },
       el('dt', { text: 'app' }), el('dd', { text: h.app ?? 'Kotoba' }),
       el('dt', { text: 'AI mode' }), el('dd', { text: h.aiMode ?? '—' }),
-      el('dt', { text: 'model key' }), el('dd', {}, h.modelKey ? el('span', { class: 'tag ok', text: 'configured' }) : el('span', { class: 'tag warn', text: 'missing — scripted mode' })),
+      el('dt', { text: 'model key' }), el('dd', {}, h.modelKey ? el('span', { class: 'tag ok', text: 'configured' }) : el('span', { class: 'tag warn', text: 'missing — tutor disabled' })),
       el('dt', { text: 'AI gateway' }), el('dd', { text: h.gateway ? 'routed through Cloudflare AI Gateway' : 'direct to Google' }),
       el('dt', { text: 'planner' }), el('dd', { class: 'mono', text: h.models?.planner ?? '—' }),
       el('dt', { text: 'in-session tutor' }), el('dd', { class: 'mono', text: h.models?.tutor ?? '—' }),
@@ -108,8 +108,8 @@ function showStatus() {
       el('dt', { text: 'mic' }), el('dd', { text: canRecord() ? 'available' : 'unavailable' }),
     ),
     h.modelKey ? null : el('div', { class: 'hint', style: { marginTop: '14px' } },
-      el('strong', { text: 'To enable the real tutor: ' }),
-      el('div', { class: 'mono small', style: { marginTop: '6px', whiteSpace: 'pre-wrap' }, text: 'wrangler secret put GEMINI_API_KEY\n# then redeploy — AI_MODE=auto picks it up automatically\n# or route via AI Gateway:\nwrangler secret put CF_AIG_TOKEN\n# plus vars CF_AI_GATEWAY_ACCOUNT and CF_AI_GATEWAY_ID' }),
+      el('strong', { text: 'The tutor is off until a key is set — nothing runs without it. To enable: ' }),
+      el('div', { class: 'mono small', style: { marginTop: '6px', whiteSpace: 'pre-wrap' }, text: 'wrangler secret put GEMINI_API_KEY\n# then redeploy and reload — no other changes needed\n# or route via AI Gateway:\nwrangler secret put CF_AIG_TOKEN\n# plus vars CF_AI_GATEWAY_ACCOUNT and CF_AI_GATEWAY_ID' }),
     ),
     el('div', { class: 'row gap', style: { marginTop: '16px' } },
       el('button', { class: 'primary', onclick: () => modal('') }, 'close'),
@@ -223,7 +223,6 @@ async function startSession({ minutes, mode, goalHint }) {
   $('#beats').replaceChildren();
   try {
     const { plan, meta, recipe } = await api('/api/session/start', { body });
-    if (meta?.degraded) toast('Model unavailable — this session was designed by the scripted tutor.');
     window.__session = new SessionRunner({
       plan, meta, recipe,
       onExit: async (again) => { await refresh(); again ? startSession({}) : show('home'); },
@@ -231,7 +230,7 @@ async function startSession({ minutes, mode, goalHint }) {
     window.__session.render($('#stage').parentElement.querySelector('#stage'));
     $('#notebook').textContent = 'Corrections and observations will appear here as we go.';
   } catch (e) {
-    $('#stage').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not start a session' }), el('p', { class: 'muted', text: e.message })));
+    $('#stage').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not start a session' }), el('p', { class: 'muted', text: e.message }), e.data?.error === 'ai_not_configured' ? el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: showStatus }, 'how to fix') : null));
   }
 }
 
@@ -940,7 +939,7 @@ async function finishPlacement(renderOnly) {
     await refresh();
     renderReveal(r);
   } catch (e) {
-    $('#onbMain').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not finish placement' }), el('p', { class: 'muted', text: e.message })));
+    $('#onbMain').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not finish placement' }), el('p', { class: 'muted', text: e.message }), e.data?.error === 'ai_not_configured' ? el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: showStatus }, 'how to fix') : null));
   }
 }
 
@@ -952,7 +951,7 @@ function renderReveal(r) {
     el('div', { class: 'stage-head' },
       el('h2', { class: 'jp', text: '結果' }),
       el('h1', { style: { fontSize: '28px' }, text: `I'd start you at ${m.overall.cefr}` }),
-      el('p', { class: 'muted', text: `Overall confidence ${Math.round(m.overall.confidence * 100)}%. ${r.meta?.kind === 'mock' ? 'This run used the scripted tutor — the shape is right but the judgement is arithmetic.' : 'This is my starting hypothesis, not a verdict.'}` }),
+      el('p', { class: 'muted', text: `Overall confidence ${Math.round(m.overall.confidence * 100)}%. This is my starting hypothesis, not a verdict.` }),
     ),
     el('div', { class: 'because' }, ICON('info'), el('span', { text: 'The next four sessions will re-calibrate this. Treat anything with low confidence as a question I am still asking.' })),
 

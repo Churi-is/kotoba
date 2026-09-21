@@ -100,7 +100,10 @@ export class SessionRunner {
     const ev = { ts: Date.now(), beatId: beatId ?? this.plan.beats[this.idx]?.id, type, payload };
     this.events.push(ev);
     api(`/api/session/${this.plan.id}/event`, { body: ev })
-      .then((r) => this.handleAdaptation(r.adaptation))
+      .then((r) => {
+        if (r.adaptationError) toast('Mid-session adjustment failed — staying on plan. (' + r.adaptationError + ')', 5200);
+        this.handleAdaptation(r.adaptation);
+      })
       .catch(() => {});
   }
 
@@ -572,9 +575,8 @@ function renderChat(beat, root, api) {
       const r = await api(`/api/session/${api.sessionId}/turn`, { body: { beatId: beat.id, text } });
       thinking.replaceChildren(el('span', { class: 'jp' }, ...textLines(r.reply)));
       history.push({ role: 'learner', text }, { role: 'tutor', text: r.reply });
-      if (r.meta?.degraded) toast('Model unavailable — using the scripted tutor for this turn.');
-    } catch {
-      thinking.replaceChildren(el('span', { text: '（つながりませんでした）Let’s keep going — try saying it another way.' }));
+    } catch (e) {
+      thinking.replaceChildren(el('span', { class: 'small', style: { color: 'var(--bad)' }, text: `⚠ tutor error: ${e.message || 'the tutor could not answer'}` }));
     }
     if (c.maxTurns && turns >= c.maxTurns) {
       root.append(el('div', { class: 'row gap', style: { marginTop: '14px' } },
@@ -607,7 +609,7 @@ RENDERERS.free_talk = renderChat;
 async function startVoice(beat, api, chat) {
   try {
     const info = await apiPost('/api/live/start', { sessionId: api.sessionId, beatId: beat.id });
-    if (info.meta?.kind === 'mock' || !info.wsPath) throw new Error('no key');
+    if (!info.wsPath) throw new Error('the server did not offer a voice session');
     await startVoiceSession({
       wsPath: info.wsPath,
       model: info.model,
@@ -616,7 +618,7 @@ async function startVoice(beat, api, chat) {
       onError: (m) => toast(m, 5000),
     });
   } catch (e) {
-    toast('Voice mode needs a Gemini key on the server. Text conversation works fully.', 5200);
+    toast(e.message || 'Voice mode is unavailable right now.', 6000);
   }
 }
 

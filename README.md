@@ -29,14 +29,13 @@ Open `http://localhost:8787`. That is the whole app.
 If you would rather use a Node 22 you already have, skip the script and just:
 `npm ci && npm run dev`.
 
-**It works with no API key.** With no key configured the app boots a *scripted* tutor —
-a deterministic engine that plans real sessions from the curriculum, marks answers,
-runs the adaptive placement staircase and writes honest feedback from stored evidence.
-It says so in the header banner and in the status dialog, because a fake tutor that
-pretends to be a model would be worse than no tutor. Everything except live voice and
-generated prose is exercised in this mode.
+**A model key is required.** There is no scripted/demo tutor: with no key configured
+the API answers `503 ai_not_configured` with the exact setup command, the app shows a
+red banner instead of a lesson, and nothing generates template content pretending to
+be a tutor. Placement, sessions, marking and review generation all run on the model —
+the only thing that works keyless is static browsing of the UI.
 
-## Turn on the real tutor
+## Turn on the tutor
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY      # Google AI Studio key
@@ -56,12 +55,14 @@ npx wrangler secret put CF_AIG_TOKEN            # gateway auth token
 Model routing lives in `wrangler.jsonc` and is worth keeping as-is: planning and
 placement synthesis use the reasoning model, in-session turns use `gemini-3.8-flash`,
 bulk generation uses `flash-lite`, voice uses `gemini-3.8-live`, and Japanese audio
-uses Gemini TTS. `AI_MODE` (`auto` | `gemini` | `mock`) forces a mode; `env.staging`
-forces `mock`.
+uses Gemini TTS. `AI_MODE` (`auto` | `gemini`) is accepted for compatibility; both
+require a key. `AI_MODE=mock` now throws on startup paths — the scripted tutor was
+removed, so a stale config is caught loudly instead of silently teaching templates.
 
-Auto-falls-back: if a model call fails or the key is wrong, that request degrades to
-the scripted tutor and the response is flagged `degraded` rather than erroring in the
-learner's face. A tutor that stops mid-sentence is worse than a slightly dull one.
+No silent fallback: if a model call fails (bad key, quota, outage) the API returns
+`502 ai_call_failed` or `502 ai_output_invalid` with the underlying message, and the
+UI shows it. You find out the tutor is broken immediately, not after a week of
+lessons that were quietly templates.
 
 ## Deploy
 
@@ -142,8 +143,9 @@ src/
   content/seed.ts       curriculum: vocabulary, grammar, kanji, scenarios, probes
   ai/prompts.ts         persona, planner/turn/feedback prompts, JSON schemas
   ai/gemini.ts          Interactions API client, Live setup, tools, TTS, gateway
-  ai/mock.ts            the scripted tutor (same interface, no key needed)
-  ai/brain.ts           TutorBrain interface, model/mock selection, degradation
+  ai/brain.ts           TutorBrain interface, Gemini implementation, config errors
+  domain/templates.ts   validated drill templates for mid-session injects
+  domain/learner-model.ts  numeric seed for the learner model from placement evidence
   runtime/learner.ts    LearnerDO: SQLite learner model + all mutations
   runtime/live.ts       LiveSessionDO: voice relay, transcript capture
 public/

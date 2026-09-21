@@ -45,8 +45,27 @@ export interface ModelResult<T = unknown> {
   interactionId?: string;
   model: string;
   usage?: { input?: number; output?: number };
-  transport: 'gateway' | 'direct' | 'mock';
+  transport: 'gateway' | 'direct';
   ms: number;
+}
+
+/** The API itself failed (HTTP error, unreachable host). Mapped to 502 by the worker. */
+export class ModelCallError extends Error {
+  readonly code = 'ai_call_failed' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelCallError';
+  }
+}
+
+/** The API answered but we could not get usable structured output, even after the
+ *  repair attempt. Mapped to 502 by the worker — never silently downgraded. */
+export class ModelOutputError extends Error {
+  readonly code = 'ai_output_invalid' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelOutputError';
+  }
 }
 
 const DEFAULT_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -155,14 +174,21 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
   }
   if (call.tools?.length) body.tools = call.tools;
 
-  const res = await fetch(`${url}/interactions`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${url}/interactions`, {
+      method: 'POST',
+      headers: headers(env),
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // DNS/TLS/timeout: the model was never even reached. Same class of failure as an
+    // HTTP error from its perspective — report it, never degrade silently.
+    throw new ModelCallError(`gemini unreachable: ${(err as Error).message}`);
+  }
   const raw = await res.text();
   if (!res.ok) {
-    throw new Error(`gemini ${res.status}: ${raw.slice(0, 600)}`);
+    throw new ModelCallError(`gemini ${res.status}: ${raw.slice(0, 600)}`);
   }
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { parsed = { output_text: raw }; }
@@ -178,7 +204,11 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
   };
 }
 
-/** Structured call with one automatic repair attempt. */
+/**
+ * Structured call with one automatic repair attempt. If the repair still does not
+ * parse, this throws ModelOutputError — callers used to fall back to scripted
+ * content here, which is exactly the silent degradation we removed.
+ */
 export async function callJSON<T>(env: Env, call: ModelCall): Promise<ModelResult<T>> {
   const first = await callModel(env, call);
   if (first.json) return first as ModelResult<T>;
@@ -187,6 +217,9 @@ export async function callJSON<T>(env: Env, call: ModelCall): Promise<ModelResul
     input: `${call.input}\n\nYour previous reply was not valid JSON. Return ONLY the JSON object, no prose, no fences.`,
     temperature: 0,
   });
+  if (!repaired.json) {
+    throw new ModelOutputError(`${call.model} returned non-JSON output twice (first ${first.text.length} chars, retry ${repaired.text.length} chars).`);
+  }
   return repaired as ModelResult<T>;
 }
 
@@ -224,7 +257,7 @@ export async function createEphemeralToken(env: Env, opts: { model: string; minu
     }),
   });
   const raw = await res.text();
-  if (!res.ok) throw new Error(`auth_tokens ${res.status}: ${raw.slice(0, 400)}`);
+  if (!res.ok) throw new ModelCallError(`auth_tokens ${res.status}: ${raw.slice(0, 400)}`);
   const body = JSON.parse(raw);
   const token = body.name ?? body.token ?? body.access_token;
   return { token, expiresAt: now + (opts.minutes ?? 30) * 60_000, model: opts.model, transport };
