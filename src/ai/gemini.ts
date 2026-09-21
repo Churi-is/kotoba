@@ -475,8 +475,10 @@ export function interactionBody(call: ModelCall): Record<string, unknown> {
   }
   if (Object.keys(generationConfig).length) body.generation_config = generationConfig;
 
+  // The API rejects this combination outright — "store must be true when
+  // previous_interaction_id is set" (400) — so chaining wins over store:false.
   if (call.previousInteractionId) body.previous_interaction_id = call.previousInteractionId;
-  if (call.store === false) body.store = false;
+  if (call.store === false && !call.previousInteractionId) body.store = false;
   if (call.background) body.background = true;
   if (call.tools?.length) body.tools = toInteractionTools(call.tools);
   return body;
@@ -675,8 +677,14 @@ export function liveSetup(opts: {
           disabled: false,
           silenceDurationMs: opts.silenceMs ?? 1800,   // room to think
           prefixPaddingMs: 300,
+          // Both of these are HIGH | LOW only — there is no MEDIUM. `start: LOW`
+          // because a learner muttering to themselves or breathing mid-thought should
+          // not be treated as the start of a turn; `end: LOW` because 1.8s of silence
+          // must pass before we decide they are finished. The cost of LOW start is a
+          // quiet learner occasionally being missed; the cost of HIGH was the model
+          // barging in, which is worse for a tutor.
           endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-          startOfSpeechSensitivity: 'START_SENSITIVITY_MEDIUM',
+          startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
         },
         activityHandling: 'START_OF_ACTIVITY_INTERRUPTS', // barge-in allowed
       },

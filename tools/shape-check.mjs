@@ -180,6 +180,16 @@ check('live: no thinkingConfig for 3.8-live', live.setup.generationConfig.thinki
 check('live: tools at the top of setup', live.setup.tools?.[0]?.functionDeclarations?.[0]?.name === 'finish_beat');
 check('live: tool params sanitised', live.setup.tools[0].functionDeclarations[0].parameters.required[0] === 'met');
 check('live: VAD window is learner-sized', live.setup.realtimeInputConfig.automaticActivityDetection.silenceDurationMs === 1800);
+// The API takes exactly HIGH | LOW here and rejects the whole setup frame (1007) for
+// anything else — including the "MEDIUM" that shipped in the original setup. Voice mode
+// never worked because of it, so it is worth an assertion rather than a comment.
+{
+  const aad = live.setup.realtimeInputConfig.automaticActivityDetection;
+  const valid = new Set(['HIGH', 'LOW']);
+  const ends = (v) => valid.has(String(v).replace(/^(START|END)_SENSITIVITY_/, ''));
+  check('live: speech sensitivities are real enum values', ends(aad.startOfSpeechSensitivity) && ends(aad.endOfSpeechSensitivity),
+    `start=${aad.startOfSpeechSensitivity} end=${aad.endOfSpeechSensitivity}`);
+}
 check('live: barge-in on', live.setup.realtimeInputConfig.activityHandling === 'START_OF_ACTIVITY_INTERRUPTS');
 check('live: transcriptions requested', 'inputAudioTranscription' in live.setup && 'outputAudioTranscription' in live.setup);
 check('live: resumption + compression set', 'sessionResumption' in live.setup && 'contextWindowCompression' in live.setup);
@@ -215,6 +225,12 @@ check('gateway-configured ephemeral token still goes direct', liveSocket(gw, { m
 check('model ids resolve for every role', ['planner', 'tutor', 'fast', 'live', 'liveDeep', 'tts']
   .every((role) => typeof MODEL_FOR(env(), role) === 'string' && MODEL_FOR(env(), role).length > 0));
 check('env overrides win over defaults', MODEL_FOR(env({ MODEL_TUTOR: 'custom-model' }), 'tutor') === 'custom-model');
+
+// A chained call must not carry store:false — the API answers
+// "store must be true when previous_interaction_id is set" (verified live, 400).
+const chained = interactionBody({ model: 'm', input: 'x', previousInteractionId: 'int_x', store: false });
+check('chaining never sends store:false', chained.previous_interaction_id === 'int_x' && !('store' in chained));
+check('store:false still honoured when not chaining', interactionBody({ model: 'm', input: 'x', store: false }).store === false);
 
 // ---------------------------------------------------------------- summary
 
