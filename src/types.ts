@@ -100,6 +100,8 @@ export interface SkillEstimate {
   confidence: number; // 0..1 — shown honestly in the UI
   evidenceCount: number;
   lastUpdated: number;
+  /** The tutor's plain-English evidence note for this estimate — the reveal renders it. */
+  why?: string;
 }
 
 export interface LearnerModel {

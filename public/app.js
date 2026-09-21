@@ -678,7 +678,7 @@ function adaptiveStage(section, title) {
             api('/api/placement/hint', { body: { section, id: it.id } }).catch(() => {});
           },
         }, 'give me the reading'), idk);
-        hintNote.textContent = 'The reading is a fair nudge; not knowing is useful information.'; 
+        hintNote.textContent = 'The reading is a fair nudge; not knowing is useful information.';
       }
       cardEl.append(row);
     };
@@ -939,7 +939,17 @@ async function finishPlacement(renderOnly) {
     await refresh();
     renderReveal(r);
   } catch (e) {
-    $('#onbMain').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not finish placement' }), el('p', { class: 'muted', text: e.message }), e.data?.error === 'ai_not_configured' ? el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: showStatus }, 'how to fix') : null));
+    // The evidence is stored server-side, so a failed synthesis is retryable as-is —
+    // the learner answered 12 stages; they should not retake them because one model
+    // call hiccuped.
+    const retry = () => {
+      $('#onbMain').replaceChildren(el('div', { class: 'card' }, el('span', { class: 'spin' }), ' Synthesising everything into a starting hypothesis…'));
+      finishPlacement(true);
+    };
+    const notConfigured = e.data?.error === 'ai_not_configured';
+    $('#onbMain').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not finish placement' }), el('p', { class: 'muted', text: e.message }),
+      notConfigured ? el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: showStatus }, 'how to fix') : null,
+      notConfigured ? null : el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: retry }, 'try again')));
   }
 }
 
