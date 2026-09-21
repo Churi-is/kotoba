@@ -224,6 +224,86 @@ export const PLAN_SCHEMA = {
   required: ['titleJA', 'titleEN', 'theme', 'rationale', 'beats'],
 } as const;
 
+/**
+ * Placement synthesis output. Placement is the one call where a free-form answer is
+ * fatal: it runs once, on the reasoning model, over the noisiest input in the app
+ * (essays, transcripts, self-reports), and the learner is staring at a spinner while
+ * it thinks. Without a machine-checked shape, a reasoning model happily writes a
+ * beautiful five-thousand-character tutor's report that no parser can read.
+ *
+ * Field-for-field this is what normalizeLearnerModel + the reveal UI consume; anything
+ * the model omits keeps the evidence-derived seed from domain/learner-model.ts.
+ * (The skill estimate is inlined eight times rather than $ref'd: model response
+ * schemas support a subset of JSON Schema and references are outside it.)
+ */
+const SKILL_ESTIMATE = {
+  type: 'object',
+  properties: {
+    cefr: { type: 'string', enum: ['pre-A1', 'A1', 'A1+', 'A2.1', 'A2', 'A2+', 'B1', 'B1+', 'B2', 'C1'] },
+    percentile: { type: 'number' },
+    confidence: { type: 'number' },
+    evidenceCount: { type: 'number' },
+    why: { type: 'string' },
+  },
+  required: ['cefr', 'confidence', 'why'],
+} as const;
+
+export const PLACEMENT_SCHEMA = {
+  type: 'object',
+  properties: {
+    skills: {
+      type: 'object',
+      properties: {
+        listening: SKILL_ESTIMATE,
+        speaking: SKILL_ESTIMATE,
+        reading: SKILL_ESTIMATE,
+        writing: SKILL_ESTIMATE,
+        vocabulary: SKILL_ESTIMATE,
+        grammar: SKILL_ESTIMATE,
+        kanji: SKILL_ESTIMATE,
+        interaction: SKILL_ESTIMATE,
+      },
+      required: ['listening', 'speaking', 'reading', 'writing', 'vocabulary', 'grammar', 'kanji', 'interaction'],
+    },
+    overall: {
+      type: 'object',
+      properties: {
+        cefr: { type: 'string', enum: ['pre-A1', 'A1', 'A1+', 'A2.1', 'A2', 'A2+', 'B1', 'B1+', 'B2', 'C1'] },
+        confidence: { type: 'number' },
+        jlptEstimate: { type: 'string', enum: ['none', 'N5', 'N4', 'N3', 'N2', 'N1'] },
+        jlptScoreBand: { type: 'array', items: { type: 'number' } },
+      },
+      required: ['cefr', 'confidence', 'jlptEstimate'],
+    },
+    vocabSizeEstimate: { type: 'number' },
+    kanjiKnown: { type: 'number' },
+    scripts: {
+      type: 'object',
+      properties: {
+        hiragana: { type: 'number' }, katakana: { type: 'number' },
+        kanji: { type: 'number' }, 'romaji-free': { type: 'number' },
+      },
+    },
+    metrics: {
+      type: 'object',
+      properties: {
+        readingWPM: { type: 'number' },
+        listeningAccuracyAtNativeSpeed: { type: 'number' },
+        meanUtteranceLength: { type: 'number' },
+        selfRepairRate: { type: 'number' },
+        codeSwitchRate: { type: 'number' },
+        fluencyScore: { type: 'number' },
+      },
+    },
+    strengths: { type: 'array', items: { type: 'string' } },
+    focusAreas: { type: 'array', items: { type: 'string' } },
+    firstMonthPlan: { type: 'array', items: { type: 'string' } },
+    notes: { type: 'array', items: { type: 'string' } },
+    confidenceCaveats: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['skills', 'overall'],
+} as const;
+
 export function plannerPrompt(req: PlanRequest): string {
   const { profile, model, recipeShape, minutes, mode, dueCards } = req;
   const level = model.overall.cefr;
@@ -419,9 +499,13 @@ JUDGEMENT RULES
 - Skill-specific bands matter more than the overall: a learner can be B1 reading and A2 speaking. That gap is the whole point of finding it.
 - For Japanese specifically, judge these separately: kana fluency, kanji recognition vs production, particle accuracy, て-form control, register (丁寧語 vs plain) control, and pitch/mora intelligibility.
 - A2.1 is a real level (JFT-Basic uses it from Aug 2026). Use it; it prevents over-claiming A2.
-- Give every estimate the evidence it rests on, in plain English, and state the single cheapest thing that would raise confidence in it.
 
-Return JSON with: skills{listening,speaking,reading,writing,vocabulary,grammar,kanji,interaction → {cefr, percentile, confidence, evidenceCount, why}}, overall{cefr, confidence, jlptEstimate, jlptScoreBand}, vocabSizeEstimate, kanjiKnown, scripts{hiragana,katakana,kanji,romaji-free}, metrics{readingWPM, listeningAccuracyAtNativeSpeed, meanUtteranceLength, codeSwitchRate, fluencyScore}, strengths[3], focusAreas[3], firstMonthPlan[4 weekly themes], recommendedRecipe, notes[2-3 tutor-notebook lines], confidenceCaveats[1-3].`;
+Return ONE JSON object matching the response schema attached to this request. No prose before or after it, no fences. Field notes:
+- every skills.<name>.why: the evidence this estimate rests on, in plain English, plus the single cheapest thing that would raise confidence in it. This is the field the learner reads — write it to them, not at them.
+- overall.jlptScoreBand: [low, high] scaled-score range, only if you can ground it.
+- firstMonthPlan: 4 weekly themes, week 1 startable tomorrow morning.
+- notes: 2–3 tutor-notebook lines your future self will need.
+- confidenceCaveats: 1–3 honest limits of this placement (skipped probes, tiny samples).`;
 }
 
 // ------------------------------------------------------------------ content tools

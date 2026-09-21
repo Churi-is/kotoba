@@ -47,6 +47,8 @@ export interface ModelResult<T = unknown> {
   usage?: { input?: number; output?: number };
   transport: 'gateway' | 'direct';
   ms: number;
+  /** e.g. "STOP" | "MAX_TOKENS" — the reason the output ended, for honest errors. */
+  finishReason?: string;
 }
 
 /** The API itself failed (HTTP error, unreachable host). Mapped to 502 by the worker. */
@@ -69,6 +71,11 @@ export class ModelOutputError extends Error {
 }
 
 const DEFAULT_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+/** Output ceiling for structured calls that don't ask for a specific one. Generous on
+ *  purpose: the reasoning planner thinks for thousands of tokens before it writes the
+ *  first brace, and a truncated object is worth exactly nothing to the parser. */
+const SCHEMA_OUTPUT_TOKENS = 16_384;
 
 export function baseUrl(env: Env): { url: string; transport: 'gateway' | 'direct' } {
   if (env.CF_AI_GATEWAY_ACCOUNT && env.CF_AI_GATEWAY_ID) {
@@ -96,16 +103,30 @@ function headers(env: Env): Record<string, string> {
   return h;
 }
 
-/** Tolerant text extraction: the API has shipped three response shapes since 2024 and
- *  we would rather keep working than be pinned to one. */
-function extractText(body: any): { text: string; interactionId?: string; usage?: any } {
+/**
+ * Tolerant text extraction: the API has shipped three response shapes since 2024 and
+ * we would rather keep working than be pinned to one.
+ *
+ * Reasoning models interleave *thought* steps/summaries with the answer. Those are
+ * excluded here: thought prose ahead of the JSON is the classic way a structured
+ * reply turns into "non-JSON output" — the parser meets an argumentative brace from
+ * the model's deliberation before it ever reaches the payload.
+ */
+export function extractText(body: any): { text: string; interactionId?: string; usage?: any; finishReason?: string } {
   if (!body) return { text: '' };
   const interactionId = body.id ?? body.interaction_id ?? body.interactionId;
   const usage = body.usage ?? body.usage_metadata ?? body.usageMetadata;
-  if (typeof body.output_text === 'string') return { text: body.output_text, interactionId, usage };
+  const steps: any[] = body.steps ?? body.outputs ?? [];
+  const lastStep = steps[steps.length - 1];
+  const finishReason =
+    body.finishReason ?? body.finish_reason
+    ?? body.candidates?.[0]?.finishReason ?? body.candidates?.[0]?.finish_reason
+    ?? lastStep?.finishReason ?? lastStep?.finish_reason ?? lastStep?.status;
+  const isThought = (x: any) => x?.thought === true || x?.isThought === true || x?.type === 'thought';
   const chunks: string[] = [];
   const pushParts = (parts: any[]) => {
     for (const p of parts ?? []) {
+      if (isThought(p)) continue; // reasoning summary, not answer text
       if (typeof p === 'string') chunks.push(p);
       else if (typeof p?.text === 'string') chunks.push(p.text);
       else if (typeof p?.output_text === 'string') chunks.push(p.output_text);
@@ -113,6 +134,7 @@ function extractText(body: any): { text: string; interactionId?: string; usage?:
     }
   };
   for (const step of body.steps ?? body.outputs ?? []) {
+    if (isThought(step)) continue;
     if (typeof step?.text === 'string') chunks.push(step.text);
     if (typeof step?.output_text === 'string') chunks.push(step.output_text);
     pushParts(step?.content?.parts ?? step?.parts ?? step?.content ?? []);
@@ -120,36 +142,49 @@ function extractText(body: any): { text: string; interactionId?: string; usage?:
   if (body.candidates) for (const c of body.candidates) pushParts(c?.content?.parts ?? []);
   if (body.output) {
     if (typeof body.output === 'string') chunks.push(body.output);
-    else pushParts(body.output?.content?.parts ?? body.output?.parts ?? []);
+    else if (!isThought(body.output)) pushParts(body.output?.content?.parts ?? body.output?.parts ?? []);
   }
-  return { text: chunks.join('').trim(), interactionId, usage };
+  return { text: chunks.join('').trim(), interactionId, usage, finishReason };
 }
 
-/** Strip fences / prose and grab the outermost JSON value. */
+/**
+ * Strip fences / prose and grab the first parseable JSON value.
+ *
+ * Every opening brace/bracket is a candidate start, not just the first one: models
+ * annotate before they answer ("skills{listening: ...}" pseudo-notation, worked
+ * examples, thought summaries that slipped through), and the first brace in such
+ * output is almost never the payload. Unparseable candidates are skipped, the first
+ * balanced-and-parseable one wins. Cheap on the sizes we deal with (tens of KB).
+ */
 export function parseJsonLoose(text: string): any | undefined {
   if (!text) return undefined;
   let t = text.trim();
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) t = fence[1].trim();
-  try { return JSON.parse(t); } catch { /* keep digging */ }
-  const first = Math.min(...[t.indexOf('{'), t.indexOf('[')].filter((n) => n >= 0));
-  if (!Number.isFinite(first)) return undefined;
-  const openCh = t[first];
-  const closeCh = openCh === '{' ? '}' : ']';
-  let depth = 0, inStr = false, esc = false;
-  for (let i = first; i < t.length; i++) {
-    const ch = t[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === '\\') esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === openCh) depth++;
-    else if (ch === closeCh) { depth--; if (depth === 0) { try { return JSON.parse(t.slice(first, i + 1)); } catch { return undefined; } } }
+  if (fence) {
+    try { return JSON.parse(fence[1].trim()); } catch { /* a fence can hold a fragment; keep digging below */ }
   }
-  return undefined;
+  const scan = (s: string): any | undefined => {
+    for (let first = 0; first < s.length; first++) {
+      const openCh = s[first];
+      if (openCh !== '{' && openCh !== '[') continue;
+      const closeCh = openCh === '{' ? '}' : ']';
+      let depth = 0, inStr = false, esc = false;
+      for (let i = first; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === '\\') esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === openCh) depth++;
+        else if (ch === closeCh) { depth--; if (depth === 0) { try { return JSON.parse(s.slice(first, i + 1)); } catch { break; } } }
+      }
+    }
+    return undefined;
+  };
+  return scan(t) ?? (fence ? scan(fence[1].trim()) : undefined);
 }
 
 export async function callModel(env: Env, call: ModelCall): Promise<ModelResult> {
@@ -159,15 +194,28 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
     model: call.model,
     input: call.input,
   };
-  if (call.system) body.system_instruction = call.system;
+  // Response-schema keys must live inside generation_config — at the top level of the
+  // request they are silently ignored, and an ignored schema is exactly how a reasoning
+  // model ends up writing five thousand characters of beautiful, unparseable prose.
+  const generationConfig: Record<string, unknown> = {};
+  if (call.temperature !== undefined) generationConfig.temperature = call.temperature;
+  if (call.schema) {
+    generationConfig.response_mime_type = 'application/json';
+    generationConfig.response_schema = call.schema;
+    // Thinking models spend output budget reasoning *before* the JSON starts. With no
+    // explicit ceiling the default one is easily consumed by thought alone and the
+    // object gets cut off mid-way — which parses as nothing, every single time.
+    generationConfig.max_output_tokens = call.maxOutputTokens ?? SCHEMA_OUTPUT_TOKENS;
+  } else if (call.maxOutputTokens !== undefined) {
+    generationConfig.max_output_tokens = call.maxOutputTokens;
+  }
+  if (Object.keys(generationConfig).length) body.generation_config = generationConfig;
   if (call.previousInteractionId) body.previous_interaction_id = call.previousInteractionId;
   if (call.store === false) body.store = false;
   if (call.background) body.background = true;
-  if (call.temperature !== undefined) body.generation_config = { temperature: call.temperature, max_output_tokens: call.maxOutputTokens };
-  else if (call.maxOutputTokens) body.generation_config = { max_output_tokens: call.maxOutputTokens };
   if (call.schema) {
-    // Ship the schema under both keys the API generations have used; harmless if ignored,
-    // plus a hard instruction in the prompt as the belt-and-braces path.
+    // Also under the top-level keys some gateway generations have used; harmless if
+    // ignored now that generation_config carries the real copy.
     body.response_format = { type: 'json_schema', json_schema: { name: 'result', schema: call.schema } };
     body.response_schema = call.schema;
     body.response_mime_type = 'application/json';
@@ -192,7 +240,7 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
   }
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { parsed = { output_text: raw }; }
-  const { text, interactionId, usage } = extractText(parsed);
+  const { text, interactionId, usage, finishReason } = extractText(parsed);
   return {
     text,
     json: call.schema ? parseJsonLoose(text) : undefined,
@@ -201,6 +249,7 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
     usage: usage ? { input: usage.input_tokens ?? usage.promptTokenCount, output: usage.output_tokens ?? usage.candidatesTokenCount } : undefined,
     transport,
     ms: Date.now() - started,
+    finishReason,
   };
 }
 
@@ -208,17 +257,29 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
  * Structured call with one automatic repair attempt. If the repair still does not
  * parse, this throws ModelOutputError — callers used to fall back to scripted
  * content here, which is exactly the silent degradation we removed.
+ *
+ * The repair is not a rerun of the same coin flip: it is colder *and* it doubles the
+ * output ceiling, because the two realistic failure modes are (a) a reasoning model
+ * narrating instead of answering and (b) the JSON being cut off mid-object — and
+ * retrying (b) at the same ceiling reproduces it with impressive consistency.
  */
 export async function callJSON<T>(env: Env, call: ModelCall): Promise<ModelResult<T>> {
   const first = await callModel(env, call);
   if (first.json) return first as ModelResult<T>;
   const repaired = await callModel(env, {
     ...call,
-    input: `${call.input}\n\nYour previous reply was not valid JSON. Return ONLY the JSON object, no prose, no fences.`,
+    input: `${call.input}\n\nYour previous reply was not valid JSON. Return ONLY the JSON object that satisfies the schema — no prose, no fences, no reasoning summary.`,
     temperature: 0,
+    maxOutputTokens: Math.max(call.maxOutputTokens ?? 0, 2 * (call.maxOutputTokens ?? SCHEMA_OUTPUT_TOKENS)),
   });
   if (!repaired.json) {
-    throw new ModelOutputError(`${call.model} returned non-JSON output twice (first ${first.text.length} chars, retry ${repaired.text.length} chars).`);
+    const describe = (r: ModelResult) => {
+      const truncated = r.finishReason && !/stop|complete/i.test(r.finishReason);
+      return truncated ? `${r.text.length} chars, ended "${r.finishReason}" (output likely cut off mid-JSON)` : `${r.text.length} chars`;
+    };
+    throw new ModelOutputError(
+      `${call.model} returned non-JSON output twice (first ${describe(first)}, retry ${describe(repaired)}).`,
+    );
   }
   return repaired as ModelResult<T>;
 }

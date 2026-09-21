@@ -13,7 +13,7 @@ import {
   MODEL_FOR, callJSON, callModel, hasKey, ModelOutputError, type ModelResult, liveSetup, LIVE_TOOLS,
 } from './gemini';
 import {
-  TUTOR_PERSONA, PLAN_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, turnSystemPrompt, turnUserPrompt,
+  TUTOR_PERSONA, PLAN_SCHEMA, PLACEMENT_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, turnSystemPrompt, turnUserPrompt,
   placementSynthesisPrompt, glossPrompt, storyPrompt, registerPrompt, debriefPrompt, planRepairPrompt, curriculumDigest,
   type PlanRequest,
 } from './prompts';
@@ -166,6 +166,10 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('planner'), system: TUTOR_PERSONA,
       input: placementSynthesisPrompt({ profile: a.profile, evidence: a.evidence, selfReport: a.profile }),
+      // The one call that must never free-form: it runs on the reasoning model over the
+      // noisiest input in the app while the learner watches a spinner. Without the schema
+      // the pro model writes a tutor's essay, and the parser meets prose, not JSON.
+      schema: PLACEMENT_SCHEMA,
       temperature: 0.3,
     });
     const j = res.json as any;
