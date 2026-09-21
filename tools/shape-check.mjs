@@ -121,6 +121,13 @@ check('$ref schemas fail loudly instead of becoming empty schemas', (() => {
   try { sanitizeSchema({ type: 'object', properties: { a: { $ref: '#/$defs/x' } } }); return false; } catch { return true; }
 })());
 
+// ---------------------------------------------------------------- tts
+
+const tts = gemini.ttsBody(env({ MODEL_TTS: 'tts-model' }), 'おはよう', { voice: 'Kore' });
+check('tts: response_format is {type: audio}', json(tts.response_format) === '{"type":"audio"}');
+check('tts: speech_config is a list of {voice}', json(tts.generation_config.speech_config) === '[{"voice":"Kore"}]');
+check('tts: model override honoured', tts.model === 'tts-model');
+
 // ---------------------------------------------------------------- response parsing
 
 const stepsBody = {

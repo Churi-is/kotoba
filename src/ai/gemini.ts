@@ -756,6 +756,19 @@ export const LIVE_TOOLS = [
  * (`system_instruction`) is no longer part of this call: the client sends its own
  * setup message, which the token accepts as long as it carries no field mask.
  */
+/** The token request body: snake_case days are over, and both times are ISO strings.
+ *  Split out so the shape is assertable without a key, like the other bodies. */
+export function tokenBody(
+  opts: { minutes?: number; newSessionMinutes?: number } = {},
+  now = Date.now(),
+): Record<string, unknown> {
+  return {
+    uses: 1,
+    expireTime: new Date(now + (opts.minutes ?? 30) * 60_000).toISOString(),
+    newSessionExpireTime: new Date(now + (opts.newSessionMinutes ?? 2) * 60_000).toISOString(),
+  };
+}
+
 export async function createEphemeralToken(
   env: Env,
   opts: { minutes?: number; newSessionMinutes?: number },
@@ -766,11 +779,7 @@ export async function createEphemeralToken(
   const res = await fetch(`${url}/auth_tokens`, {
     method: 'POST',
     headers: headers(env),
-    body: JSON.stringify({
-      uses: 1,
-      expireTime: new Date(expiresAt).toISOString(),
-      newSessionExpireTime: new Date(now + (opts.newSessionMinutes ?? 2) * 60_000).toISOString(),
-    }),
+    body: JSON.stringify(tokenBody(opts, now)),
   });
   const raw = await res.text();
   if (!res.ok) throw new ModelCallError(describeError(res.status, raw), res.status);
@@ -800,6 +809,17 @@ export async function createEphemeralToken(
  * but its TTS models (Deepgram Aura 1/2) are English/Spanish only — so Japanese audio
  * deliberately does not go through Workers AI.
  */
+/** The TTS request body, split out for the same reason as `interactionBody`: this
+ *  shape is one of the ones that broke, so it should be assertable without a key. */
+export function ttsBody(env: Env, text: string, opts: { voice?: string } = {}): Record<string, unknown> {
+  return {
+    model: env.MODEL_TTS || 'gemini-3.1-flash-tts-preview',
+    input: text,
+    response_format: { type: 'audio' },
+    generation_config: { speech_config: [{ voice: opts.voice ?? 'Aoede' }] },
+  };
+}
+
 export async function synthesize(
   env: Env,
   text: string,
@@ -810,14 +830,7 @@ export async function synthesize(
   const res = await fetch(`${url}/interactions`, {
     method: 'POST',
     headers: headers(env),
-    body: JSON.stringify({
-      model: env.MODEL_TTS || 'gemini-3.1-flash-tts-preview',
-      input: text,
-      response_format: { type: 'audio' },
-      generation_config: {
-        speech_config: [{ voice: opts.voice ?? 'Aoede' }],
-      },
-    }),
+    body: JSON.stringify(ttsBody(env, text, opts)),
   });
   if (!res.ok) {
     // The caller falls back to browser speech synthesis, which is a normal outcome —
