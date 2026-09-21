@@ -552,6 +552,14 @@ app.post('/api/session/:id/beat/:beatId/mark', async (c) => {
 app.post('/api/session/:id/finish', async (c) => {
   const id = c.req.param('id');
   const l = learner(c.env, c.get('learnerId'));
+
+  // Finishing is a retryable network operation. If the browser timed out after the
+  // server had already committed the debrief, return the committed result instead of
+  // asking the model again (or reporting "unknown session" after the active plan was
+  // removed).
+  const finished = await l.kvGet<any>(`session:${id}:finished`);
+  if (finished?.debrief && finished?.summary) return Response.json(finished);
+
   const s = await l.kvGet<any>(`session:${id}`);
   if (!s) return bad('unknown session', 404);
 
@@ -564,7 +572,14 @@ app.post('/api/session/:id/finish', async (c) => {
   }, { answered: 0, correct: 0, spokenTurns: 0, writtenTurns: 0, hintUses: 0, skipped: 0 });
 
   const transcript = (s.events ?? []).map((e: any) => ({ role: e.type === 'utterance' ? 'learner' : 'tutor', text: String(e.payload?.text ?? '') })).filter((t: any) => t.text);
-  const { debrief } = await brain(c).debrief({ plan: s.plan, transcript, profile: await l.getProfile(), model: (await l.getModel()) as any });
+  // Cache the model's debrief before applying the learner-model writes. A transient
+  // storage error after generation should not force a second expensive model call or
+  // duplicate the learner's corrections when they press retry.
+  const cachedDebrief = await l.kvGet<any>(`session:${id}:debrief`);
+  const debrief = cachedDebrief ?? (await brain(c).debrief({
+    plan: s.plan, transcript, profile: await l.getProfile(), model: (await l.getModel()) as any,
+  })).debrief;
+  if (!cachedDebrief) await l.kvPut(`session:${id}:debrief`, debrief);
 
   for (const c2 of debrief.newCards ?? []) {
     await l.addCards([{ kind: 'vocab', surface: c2.surface, reading: c2.reading, meaning: c2.meaning }], 'session');
@@ -581,8 +596,11 @@ app.post('/api/session/:id/finish', async (c) => {
     nextTeaser: debrief.nextTeaser,
   };
   await l.finishSession(summary);
+  const result = { debrief, summary };
+  await l.kvPut(`session:${id}:finished`, result);
   await l.kvDel(`session:${id}`);
-  return Response.json({ debrief, summary });
+  await l.kvDel(`session:${id}:debrief`);
+  return Response.json(result);
 });
 
 // ------------------------------------------------------------------ review (SRS)

@@ -446,6 +446,38 @@ export const FEEDBACK_SCHEMA = {
   required: ['achieved', 'wins', 'notices', 'nextTime'],
 } as const;
 
+/** The closing call is rendered directly by the client, so keep it structured like
+ * every other learner-facing AI response. Free-form JSON was occasionally returned as
+ * prose or a truncated object, which made an otherwise completed session look lost. */
+export const DEBRIEF_SCHEMA = {
+  type: 'object',
+  properties: {
+    headline: { type: 'string', description: 'One warm, honest sentence about this session.' },
+    highlights: { type: 'array', items: { type: 'string' }, description: 'Two or three specific wins, quoting the learner when possible.' },
+    toKeep: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          quote: { type: 'string' },
+          recast: { type: 'string' },
+          elicit: { type: 'string' },
+          tag: { type: 'string' },
+          severity: { type: 'number' },
+        },
+      },
+    },
+    newCards: {
+      type: 'array',
+      items: { type: 'object', properties: { surface: { type: 'string' }, reading: { type: 'string' }, meaning: { type: 'string' } } },
+    },
+    canDoAdvanced: { type: 'string' },
+    nextTeaser: { type: 'string' },
+    notebook: { type: 'string' },
+  },
+  required: ['headline', 'highlights', 'toKeep', 'newCards', 'nextTeaser', 'notebook'],
+} as const;
+
 export function feedbackPrompt(args: {
   profile: Profile; model: LearnerModel; plan: SessionPlan; beat: Beat;
   transcript: { role: 'tutor' | 'learner'; text: string }[];
@@ -568,7 +600,7 @@ ${timing === 'after' ? 'This learner asked for corrections AFTER the session, so
 Their production, in order:
 ${learnerLines.map((l, i) => `${i + 1}. ${l}`).join('\n') || '(nothing captured)'}
 
-Return JSON: {headline (one warm sentence), highlights[2-3 specific wins quoting them], toKeep[2-3 {quote, recast, elicit, tag}], newCards[0-4 {surface,reading,meaning}], canDoAdvanced[string], nextTeaser(string, one sentence in the tutor's voice), notebook(string: 1-2 lines of private notes for your own future planning — what worked, what to do differently)}.`;
+Return only JSON matching the response schema attached to this request: {headline (one warm sentence), highlights[2-3 specific wins quoting them], toKeep[2-3 {quote, recast, elicit, tag}], newCards[0-4 {surface,reading,meaning}], canDoAdvanced[string], nextTeaser(string, one sentence in the tutor's voice), notebook(string: 1-2 lines of private notes for your own future planning — what worked, what to do differently)}.`;
 }
 
 export function planRepairPrompt(badOutput: string, problems: string[], req: PlanRequest): string {

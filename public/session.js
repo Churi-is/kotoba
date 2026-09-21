@@ -28,6 +28,10 @@ export class SessionRunner {
 
   render(root) {
     this.root = root;
+    this.finishing = false;
+    this.finished = false;
+    const endButton = document.getElementById('endSession');
+    if (endButton) endButton.disabled = false;
     this.renderRail();
     this.stage = el('div', { class: 'stage-inner' });
     root.replaceChildren(this.stage);
@@ -301,16 +305,46 @@ export class SessionRunner {
   }
 
   async finish() {
+    // A debrief request can take a few seconds. Guard the button while it is in flight;
+    // two finish requests used to race, with one deleting the active session while the
+    // other was still trying to render it. Keep the runner on screen when generation
+    // fails so the learner can retry instead of being sent home with no explanation.
+    if (this.finishing || this.finished) return;
+    this.finishing = true;
+    const endButton = document.getElementById('endSession');
+    if (endButton) endButton.disabled = true;
+
+    const status = el('div', { class: 'card debrief-loading' },
+      el('div', { class: 'row gap' }, el('span', { class: 'spin' }), el('strong', { text: 'Aoi is writing your debrief…' })),
+      el('p', { class: 'small muted', style: { marginTop: '10px' }, text: 'Your answers and conversation are already saved. This usually takes a few seconds.' }),
+    );
+    this.stage.replaceChildren(status);
+
     try {
-      const { debrief } = await api(`/api/session/${this.plan.id}/finish`, { body: {} });
-      renderDebrief(this.stage, debrief, {
+      const result = await api(`/api/session/${this.plan.id}/finish`, { body: {} });
+      if (!result?.debrief) throw new Error('The tutor returned an empty debrief. Try again.');
+      renderDebrief(this.stage, result.debrief, {
         onExit: this.onExit,
         onAgain: () => this.onExit?.(true),
       });
+      this.finishing = false;
+      this.finished = true;
       this.root.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } catch {
-      toast('Could not build the debrief — your progress was still saved.');
-      this.onExit?.();
+    } catch (err) {
+      this.finishing = false;
+      this.finished = false;
+      if (endButton) endButton.disabled = false;
+      const message = err?.message || 'The tutor could not build the debrief.';
+      this.stage.replaceChildren(el('div', { class: 'card debrief-error' },
+        el('div', { class: 'panel-title' }, ICON('info'), 'session wrap-up'),
+        el('h2', { text: 'The debrief could not be generated' }),
+        el('p', { class: 'muted', text: message }),
+        el('p', { class: 'small muted', text: 'Nothing was lost. Your activity evidence is saved, and you can try the debrief again.' }),
+        el('div', { class: 'row gap', style: { marginTop: '16px' } },
+          el('button', { class: 'primary', onclick: () => this.finish() }, 'Try the debrief again'),
+          el('button', { class: 'ghost', onclick: () => this.onExit?.() }, 'Back to today'),
+        ),
+      ));
     }
   }
 }
@@ -421,7 +455,7 @@ function renderReading(beat, root, api) {
     const box = el('div', { class: 'gloss' },
       el('div', { class: 'row between' }, el('span', { class: 'w jp', text: term }), el('button', { class: 'iconbtn', onclick: () => box.remove() }, '×')),
       el('div', { class: 'r jp', text: g.reading || '' }),
-      el('div', { text: g.meaningEN || '' }),
+      el('div', { text: g.meaningEN || g.meaning || '' }),
       g.note ? el('div', { class: 'small muted', style: { marginTop: '6px' }, text: g.note }) : null,
       el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: () => speak(g.example || term) }, '▶ hear it'),
     );
@@ -500,8 +534,14 @@ function renderListening(beat, root, api) {
   renderQuiz({ ...beat, quiz: l.questions }, qbox, api);
 }
 
+// These are real tools, not fallback content. Keep the registrations next to the
+// renderer definitions: omitting one makes the runner show its "no renderer" card even
+// though the implementation exists below the planner contract.
+RENDERERS.reading = renderReading;
+RENDERERS.listening = renderListening;
+
 /** Conversation / roleplay / free talk: the actual tutoring, turn by turn. */
-function renderChat(beat, root, api) {
+function renderChat(beat, root, beatApi) {
   const c = beat.conversation ?? {};
   const history = [];
   const chat = el('div', { class: 'chat' });
@@ -509,16 +549,27 @@ function renderChat(beat, root, api) {
   const turnLabel = el('span', { class: 'small muted', text: c.maxTurns ? `0 / ${c.maxTurns} turns` : '0 turns' });
 
   if (c.setting) {
-    root.append(el('div', { class: 'card', style: { marginBottom: '14px' } },
-      el('div', { class: 'row between wrap gap' },
-        el('div', {},
-          el('div', { class: 'jp', style: { fontSize: '17px' }, text: c.setting }),
-          el('div', { class: 'small muted', text: `You are the ${c.learnerRole} · I am the ${c.tutorRole}` }),
-        ),
+    root.append(el('div', { class: 'card scenario-card' },
+      el('div', { class: 'scenario-topline' },
+        el('span', { class: 'scenario-kicker', text: 'text chat simulation' }),
         turnLabel,
       ),
-      el('div', { style: { marginTop: '10px' } }, el('strong', { class: 'small', text: 'Your goal: ' }), el('span', { class: 'small', text: c.learnerGoal })),
-      c.constraints?.length ? el('div', { class: 'row gap wrap', style: { marginTop: '8px' } },
+      el('h3', { class: 'scenario-title', text: c.setting }),
+      el('div', { class: 'scenario-roles' },
+        el('div', { class: 'scenario-role' },
+          el('span', { class: 'scenario-role-label', text: 'You are' }),
+          el('span', { text: c.learnerRole || 'the learner' }),
+        ),
+        el('div', { class: 'scenario-role' },
+          el('span', { class: 'scenario-role-label', text: 'Aoi is' }),
+          el('span', { text: c.tutorRole || 'your tutor' }),
+        ),
+      ),
+      el('div', { class: 'scenario-goal' },
+        el('strong', { class: 'small', text: 'Your goal' }),
+        el('span', { class: 'small', text: c.learnerGoal || 'Keep the conversation going.' }),
+      ),
+      c.constraints?.length ? el('div', { class: 'row gap wrap scenario-constraints' },
         ...c.constraints.map((x) => el('span', { class: 'tag warn', text: x }))) : null,
     ));
   }
@@ -567,12 +618,12 @@ function renderChat(beat, root, api) {
     if (!text) return;
     input.value = '';
     add('learner', text);
-    if (!preset) api.emit('utterance', { text });
+    if (!preset) beatApi.emit('utterance', { text });
     turns++;
     turnLabel.textContent = c.maxTurns ? `${turns} / ${c.maxTurns} turns` : `${turns} turns`;
     const thinking = add('tutor', '…');
     try {
-      const r = await api(`/api/session/${api.sessionId}/turn`, { body: { beatId: beat.id, text } });
+      const r = await api(`/api/session/${beatApi.sessionId}/turn`, { body: { beatId: beat.id, text } });
       thinking.replaceChildren(el('span', { class: 'jp' }, ...textLines(r.reply)));
       history.push({ role: 'learner', text }, { role: 'tutor', text: r.reply });
     } catch (e) {
@@ -580,7 +631,7 @@ function renderChat(beat, root, api) {
     }
     if (c.maxTurns && turns >= c.maxTurns) {
       root.append(el('div', { class: 'row gap', style: { marginTop: '14px' } },
-        el('button', { class: 'primary', onclick: () => api.complete() }, 'Wrap up this scene'),
+        el('button', { class: 'primary', onclick: () => beatApi.complete() }, 'Wrap up this scene'),
       ));
     }
   }
@@ -589,11 +640,11 @@ function renderChat(beat, root, api) {
   add('tutor', c.openingLine ?? 'こんにちは。今日は 何を しましょうか。');
   if (c.openingTranslation) root.append(el('div', { class: 'tiny muted', style: { marginTop: '6px' }, text: c.openingTranslation }));
   root.append(el('div', { class: 'row gap wrap', style: { marginTop: '12px' } },
-    el('button', { class: 'soft small', onclick: () => startVoice(beat, api, chat) }, '🎧 voice mode (hands-free)'),
+    el('button', { class: 'soft small', onclick: () => startVoice(beat, beatApi, chat) }, '🎧 voice mode (hands-free)'),
     el('button', { class: 'ghost small', onclick: () => {
       const h = (beat.scaffolding ?? [])[0] ?? 'Say it simply: subject + を + verb.';
       root.append(el('div', { class: 'hint jp' }, h));
-      api.emit('hint', { level: 1 });
+      beatApi.emit('hint', { level: 1 });
     } }, 'I’m stuck'),
     el('button', { class: 'ghost small', onclick: () => {
       const phrase = (beat.targets ?? [])[0]?.surface;
