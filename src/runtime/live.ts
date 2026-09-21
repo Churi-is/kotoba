@@ -21,7 +21,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
-import { liveWsUrl, MODEL_FOR } from '../ai/gemini';
+import { LIVE_TOOLS, liveSetup, liveSocketRequest, MODEL_FOR } from '../ai/gemini';
 
 interface SessionMeta {
   learnerId: string;
@@ -91,15 +91,19 @@ export class LiveSessionDO extends DurableObject<Env> {
     const meta = this.meta;
     if (!meta?.systemInstruction) throw new Error('missing system instruction');
 
-    const url = liveWsUrl(this.env, { model: meta.model });
-    const ws = new WebSocket(url);
+    // Upgrade over fetch rather than `new WebSocket(url)`: the setup is the same, but
+    // fetch lets us send real headers, which is what AI Gateway auth needs (a browser
+    // would have to smuggle the token through a subprotocol instead).
+    let res: Response;
+    try {
+      res = await fetch(liveSocketRequest(this.env, { model: meta.model }));
+    } catch (err) {
+      throw new Error(`live socket unreachable: ${(err as Error).message}`);
+    }
+    const ws = res.webSocket;
+    if (!ws) throw new Error(`live socket refused (${res.status})`);
+    ws.accept();
     this.upstream = ws;
-
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timeout opening Live socket')), 12_000);
-      ws.addEventListener('open', () => { clearTimeout(t); resolve(); });
-      ws.addEventListener('error', (e) => { clearTimeout(t); reject(new Error('live socket error')); });
-    });
 
     ws.send(JSON.stringify(setupFrame(this.env, meta)));
 
@@ -109,8 +113,8 @@ export class LiveSessionDO extends DurableObject<Env> {
       try { msg = JSON.parse(raw); } catch { return; }
       await this.handleUpstream(msg, server);
     });
-    ws.addEventListener('close', () => {
-      server.send(JSON.stringify({ type: 'upstream_closed' }));
+    ws.addEventListener('close', (ev: CloseEvent) => {
+      try { server.send(JSON.stringify({ type: 'upstream_closed', code: ev?.code, reason: ev?.reason })); } catch {}
       this.ctx.storage.setAlarm(Date.now() + 30_000);
     });
     ws.addEventListener('error', () => {
@@ -165,6 +169,12 @@ export class LiveSessionDO extends DurableObject<Env> {
     }
 
     if (msg.toolCall) await this.handleToolCall(msg.toolCall, server);
+    // Extended-thinking sessions speak while they reason, so `turnComplete` alone no
+    // longer means "idle" — the status field does. Forward it so the client can show
+    // that Aoi is thinking rather than waiting for input.
+    if (msg.interactionStatus) {
+      try { server.send(JSON.stringify({ type: 'interaction_status', status: msg.interactionStatus })); } catch { /* client gone */ }
+    }
     if (msg.goAway) {
       try { server.send(JSON.stringify({ type: 'go_away', timeLeft: msg.goAway.timeLeft })); } catch {}
     }
@@ -313,42 +323,23 @@ export class LiveSessionDO extends DurableObject<Env> {
 
 // ---------------------------------------------------------------- helpers
 
+/**
+ * The setup frame is built by the shared client (gemini.ts) so the relay, the worker
+ * and any direct-mode path cannot drift apart: field placement in this message is
+ * load-bearing (modalities and voice inside generationConfig, tools/transcriptions/
+ * resumption at the top), and the thinking level is a property of the model.
+ */
 function setupFrame(env: Env, meta: SessionMeta) {
   const model = meta.model || MODEL_FOR(env, 'live');
-  return JSON.stringify({
-    setup: {
-      model: `models/${model}`,
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        speechConfig: { languageCode: 'ja-JP', voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } },
-      },
-      systemInstruction: { parts: [{ text: meta.systemInstruction }] },
-      // Turn-taking tuned for a learner, not a call-centre bot: give them room to think.
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          disabled: false,
-          silenceDurationMs: 1800,
-          prefixPaddingMs: 300,
-          endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-          startOfSpeechSensitivity: 'START_SENSITIVITY_MEDIUM',
-        },
-        activityHandling: 'START_OF_ACTIVITY_INTERRUPTS',
-      },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
-      tools: [{
-        functionDeclarations: [
-          { name: 'log_error', description: 'Log a language error the learner just made. Use silently; do not announce it.', parameters: { type: 'object', properties: { tag: { type: 'string' }, quote: { type: 'string' }, recast: { type: 'string' }, severity: { type: 'number' } }, required: ['tag', 'quote'] } },
-          { name: 'lookup_item', description: 'Check whether the learner already knows an item before deciding to pre-teach it.', parameters: { type: 'object', properties: { surface: { type: 'string' } }, required: ['surface'] } },
-          { name: 'add_to_review', description: 'Add an item to their spaced-repetition queue.', parameters: { type: 'object', properties: { surface: { type: 'string' }, reading: { type: 'string' }, meaning: { type: 'string' }, kind: { type: 'string' } }, required: ['surface'] } },
-          { name: 'note_for_next_session', description: 'Private note for your future self.', parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] } },
-          { name: 'finish_beat', description: 'The current activity is finished (met or not met).', parameters: { type: 'object', properties: { met: { type: 'boolean' }, because: { type: 'string' } }, required: ['met'] } },
-        ],
-      }],
-      ...(meta.resumptionHandle ? { sessionResumption: { handle: meta.resumptionHandle } } : { sessionResumption: {} }),
-      contextWindowCompression: { slidingWindow: {} },
-    },
-  });
+  return JSON.stringify(liveSetup({
+    model,
+    systemInstruction: meta.systemInstruction,
+    tools: LIVE_TOOLS,
+    resumptionHandle: meta.resumptionHandle,
+    // Only the extended-thinking model takes a level, and it *requires* one; deep
+    // sessions are exactly the ones that want the reasoning.
+    thinking: meta.deep ? 'high' : 'low',
+  }));
 }
 
 function base64(buf: ArrayBuffer): string {

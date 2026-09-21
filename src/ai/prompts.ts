@@ -392,8 +392,15 @@ RUNTIME RULES
 Apply the learner's current i+1: their level is ${model.overall.cefr}, so your Japanese should be one notch above what they produce, never two.`;
 }
 
-export function turnUserPrompt(history: { role: 'tutor' | 'learner'; text: string }[], learnerText: string): string {
-  const recent = history.slice(-8).map((h) => `${h.role === 'tutor' ? 'AOI' : 'LEARNER'}: ${h.text}`).join('\n');
+export function turnUserPrompt(
+  history: { role: 'tutor' | 'learner'; text: string }[],
+  learnerText: string,
+  opts: { skipHistory?: boolean } = {},
+): string {
+  // When the turn continues a stored interaction the server already holds the
+  // conversation, so re-sending it would duplicate context. The tail instruction is
+  // the part the model must see either way.
+  const recent = opts.skipHistory ? '' : history.slice(-8).map((h) => `${h.role === 'tutor' ? 'AOI' : 'LEARNER'}: ${h.text}`).join('\n');
   return `${recent ? `CONVERSATION SO FAR\n${recent}\n\n` : ''}LEARNER JUST SAID: ${learnerText}
 
 Reply as Aoi: 1–3 short Japanese sentences. Then optionally, on a new line beginning exactly with "NOTE:", one line of private tutoring note for the debrief log (English, no more than 15 words) — omit it entirely if there is nothing worth noting.`;

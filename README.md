@@ -55,9 +55,31 @@ npx wrangler secret put CF_AIG_TOKEN            # gateway auth token
 Model routing lives in `wrangler.jsonc` and is worth keeping as-is: planning and
 placement synthesis use the reasoning model, in-session turns use `gemini-3.8-flash`,
 bulk generation uses `flash-lite`, voice uses `gemini-3.8-live`, and Japanese audio
-uses Gemini TTS. `AI_MODE` (`auto` | `gemini`) is accepted for compatibility; both
-require a key. `AI_MODE=mock` now throws on startup paths — the scripted tutor was
-removed, so a stale config is caught loudly instead of silently teaching templates.
+uses Gemini TTS.
+
+## Verify the model wiring
+
+The API is strict: an unknown field is a `400`, and the request shape changed in
+May 2026 (`response_schema` and `response_mime_type` no longer exist; structured
+output is one `response_format` object). Two checks keep us honest —
+**[docs/gemini-api.md](./docs/gemini-api.md)** is the reference both are written against:
+
+```bash
+npm run check:shapes                     # offline: request bodies, parsing, Live setup
+GEMINI_API_KEY=… npm run smoke           # live: every call shape, plus one deliberate 400
+```
+
+`check:shapes` needs no key and no network, and it asserts the exact things that broke
+before: no `response_schema`, no `temperature`, `system_instruction` present, thinking
+levels resolved per model, the Live socket on the right host. `smoke` runs the same
+shapes against the real API and also opens a voice socket — if something in Google's
+surface moves again, that is the tool that will say so first.
+
+## Configuration
+
+`AI_MODE` (`auto` | `gemini`) is accepted for compatibility; both require a key.
+`AI_MODE=mock` now throws on startup paths — the scripted tutor was removed, so a
+stale config is caught loudly instead of silently teaching templates.
 
 No silent fallback: if a model call fails (bad key, quota, outage) the API returns
 `502 ai_call_failed` or `502 ai_output_invalid` with the underlying message, and the
