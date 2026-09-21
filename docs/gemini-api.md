@@ -61,6 +61,13 @@ always a valid request.
   can spend the whole thing thinking and hand back a truncated object, which is why a
   structured retry lowers the thinking level and raises the ceiling rather than just
   re-rolling the dice.
+* *Latency budget.* The client aborts slow calls before Cloudflare's 100s edge/gateway
+  timeout turns them into a bare `524`: 60s by default, 90s for the planner and
+  placement synthesis. Those two used to run high thinking with a 32k ceiling and
+  timed out in production (`gemini 524` after minutes of spinner); they now run low
+  thinking with 16k, still far above the ~4–8k tokens a full plan needs. A timeout
+  throws a retryable error — never retried silently, because a second 90s generation
+  the learner didn't ask for is worse than a clear message with a retry button.
 * Structured output supports a subset of JSON Schema: `type` (`string`/`number`/
   `integer`/`boolean`/`object`/`array`/`null`, and `["string","null"]` unions),
   `properties`, `required`, `additionalProperties`, `enum`, `format`, `items`,

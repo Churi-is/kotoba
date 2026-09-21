@@ -219,10 +219,20 @@ async function startSession({ minutes, mode, goalHint }) {
     goalHint,
   };
   show('session');
-  $('#stage').replaceChildren(el('div', { class: 'card' }, el('span', { class: 'spin' }), ' Aoi is designing today’s session from your model…'));
+  const status = el('span', { text: ' Aoi is designing today’s session from your model…' });
+  $('#stage').replaceChildren(el('div', { class: 'card' }, el('span', { class: 'spin' }), status));
   $('#beats').replaceChildren();
+  // Session design is the slowest call in the app — a reasoning model writing a whole
+  // lesson plan. Narrate the wait so 30–60s reads as progress, not a hang.
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    if (s > 45) status.textContent = ' Still designing — the planner is thinking hard. This can take up to about 90 seconds…';
+    else if (s > 15) status.textContent = ' Still designing — weighing your errors, due cards and goals…';
+  }, 2000);
   try {
     const { plan, meta, recipe } = await api('/api/session/start', { body });
+    clearInterval(tick);
     window.__session = new SessionRunner({
       plan, meta, recipe,
       onExit: async (again) => { await refresh(); again ? startSession({}) : show('home'); },
@@ -230,7 +240,16 @@ async function startSession({ minutes, mode, goalHint }) {
     window.__session.render($('#stage').parentElement.querySelector('#stage'));
     $('#notebook').textContent = 'Corrections and observations will appear here as we go.';
   } catch (e) {
-    $('#stage').replaceChildren(el('div', { class: 'card' }, el('h3', { text: 'Could not start a session' }), el('p', { class: 'muted', text: e.message }), e.data?.error === 'ai_not_configured' ? el('button', { class: 'ghost small', style: { marginTop: '8px' }, onclick: showStatus }, 'how to fix') : null));
+    clearInterval(tick);
+    // A failed plan is retryable, not a dead end: nothing is stored server-side until a
+    // plan validates, so trying again is always safe. Timeouts especially clear on retry.
+    $('#stage').replaceChildren(el('div', { class: 'card' },
+      el('h3', { text: 'Could not start a session' }),
+      el('p', { class: 'muted', text: e.message }),
+      el('div', { class: 'row gap', style: { marginTop: '8px' } },
+        el('button', { class: 'primary small', onclick: () => startSession({ minutes: chosen, mode: body.mode, goalHint }) }, 'Try again'),
+        e.data?.error === 'ai_not_configured' ? el('button', { class: 'ghost small', onclick: showStatus }, 'how to fix') : null,
+      )));
   }
 }
 
