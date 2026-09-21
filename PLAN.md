@@ -7,9 +7,10 @@ another multiple-choice column: the model decides *what you should do next* from
 kit of sixteen activities, then hands you the right instrument for each one.
 
 Status: **working prototype.** Backend, curriculum, session engine, placement
-instrument, scripted tutor and SPA are implemented and running under `wrangler dev`.
-Model-backed paths (Gemini 3.8 interactions, Live voice) are wired but need a key to
-exercise — they have never been run against the live API from this sandbox. See
+instrument and SPA are implemented and running under `wrangler dev`. The scripted
+tutor was removed: a model key is required, and misconfiguration surfaces as an
+explicit error (503/502) rather than template content. Model-backed paths (Gemini 3.8
+interactions, Live voice) are wired but need a key to exercise. See
 *Honest status* at the end.
 
 ---
@@ -195,8 +196,10 @@ LearnerDO (per learner, SQLite)
 - **Model tiering** — `gemini-3.1-pro-preview` plans (once per session, thinking is
   worth it), `gemini-3.8-flash` runs turns and marking, `gemini-3.5-flash-lite` does
   bulk generation, `gemini-3.8-live` speaks. See *Costs*.
-- **`AI_MODE=auto|gemini|mock`** — without a key the app runs a genuine scripted tutor
-  rather than breaking. It is labelled as such in the UI.
+- **`AI_MODE=auto|gemini`** — a key is required in both. `mock` was removed: without
+  a key the API returns `503 ai_not_configured` with the fix in the message instead
+  of running script-generated lessons, and model failures return `502` rather than
+  degrading to templates.
 
 ---
 

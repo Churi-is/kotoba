@@ -56,7 +56,9 @@ export async function api(path, opts = {}) {
   const text = await res.text();
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, data });
+  // Server errors carry {error: machineCode, message: human text} — the message is
+  // written for the person using the app, so that is what we show.
+  if (!res.ok) throw Object.assign(new Error(data.message || data.error || `HTTP ${res.status}`), { status: res.status, code: data.error, data });
   return data;
 }
 
