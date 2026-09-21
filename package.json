@@ -1,0 +1,27 @@
+{
+  "name": "kotoba",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kotoba \u2014 a 1:1 AI Japanese tutor. Gemini 3.8 designs the sessions; the app provides the tools.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --ip 0.0.0.0 --port 8787",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "tail": "wrangler tail",
+    "check": "tsc --noEmit",
+    "shots": "node tools/shots.mjs",
+    "audit": "node tools/audit.mjs",
+    "audit:mobile": "node tools/audit.mjs --mobile",
+    "seed": "node tools/seed.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260918.1",
+    "playwright": "^1.63.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.135.0"
+  }
+}

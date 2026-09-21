@@ -1,0 +1,65 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kotoba",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-19",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Static SPA + API on the same origin. /api/* always runs the Worker first.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        // One Durable Object per learner = per-entity SQLite storage for the learner model.
+        "name": "LEARNER",
+        "class_name": "LearnerDO"
+      },
+      {
+        // One Durable Object per live voice session; hibernating WebSocket relay to Gemini Live.
+        "name": "LIVE",
+        "class_name": "LiveSessionDO"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LearnerDO", "LiveSessionDO"]
+    }
+  ],
+
+  // Optional: async generation of the *next* session pack, weekly review reports, SRS reminders.
+  "queues": {
+    "producers": [{ "binding": "TASKS", "queue": "kotoba-tasks" }]
+  },
+
+  "observability": {
+    "logs": { "enabled": true, "head_sampling_rate": 1 }
+  },
+
+  "vars": {
+    "AI_MODE": "auto",                       // auto | gemini | mock
+    "GEMINI_BASE": "https://generativelanguage.googleapis.com/v1beta",
+    "MODEL_PLANNER": "gemini-3.1-pro-preview", // deep design work: plans, placement synthesis, weekly reviews
+    "MODEL_TUTOR": "gemini-3.8-flash",         // in-session turns, feedback, item generation
+    "MODEL_FAST": "gemini-3.5-flash-lite",     // bulk: distractor generation, gloss enrichment
+    "MODEL_LIVE": "gemini-3.8-live",           // native speech-to-speech voice, 70+ languages
+    "MODEL_LIVE_DEEP": "gemini-3.8-live-extended-thinking",
+    "MODEL_TTS": "gemini-3.1-flash-tts-preview", // Japanese audio for reading/listening/shadowing
+    "DEFAULT_L1": "en",
+    "APP_NAME": "Kotoba"
+  },
+
+  "env": {
+    "staging": {
+      "vars": { "AI_MODE": "mock" }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+.npm/
+
+# wrangler / local dev state
+.wrangler/
+.dev.vars
+worker-configuration.d.ts
+
+# visual QA output — screenshots are artefacts, not source
+shots/
+audit.json
+
+# build output
+dist/
+build/
+out/
+coverage/
+
+# the app bundle produced for handoff
+*.zip
+
+# os / editor noise
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
