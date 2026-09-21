@@ -11,6 +11,7 @@
 import type { Beat, Env, Feedback, LearnerModel, Profile, SessionPlan } from '../types';
 import {
   MODEL_FOR, callJSON, callModel, hasKey, ModelCallError, ModelOutputError, type ModelResult, liveSetup, LIVE_TOOLS,
+  SLOW_CALL_TIMEOUT_MS,
 } from './gemini';
 import {
   TUTOR_PERSONA, PLAN_SCHEMA, PLACEMENT_SCHEMA, plannerPrompt, feedbackPrompt, FEEDBACK_SCHEMA, turnSystemPrompt, turnUserPrompt,
@@ -92,8 +93,14 @@ class GeminiBrain implements TutorBrain {
 
   async planSession(req: PlanRequest): Promise<PlanResult> {
     const input = plannerPrompt(req) + '\n\n' + curriculumDigest(req.model.overall.cefr);
+    // Latency budget, learned the hard way: this call used to run the reasoning model
+    // at high thinking with a 32k ceiling, which on a slow day thinks past the 100s
+    // gateway/edge timeout and surfaces as `gemini 524` after minutes of spinner. Low
+    // thinking on the planner is still strong design judgement, and a complete plan is
+    // ~4–8k tokens — 16k of combined budget leaves ample headroom for thoughts on top.
     const res = await callJSON<any>(this.env, {
-      model: this.m('planner'), system: TUTOR_PERSONA, input, schema: PLAN_SCHEMA, thinking: 'deep',
+      model: this.m('planner'), system: TUTOR_PERSONA, input, schema: PLAN_SCHEMA,
+      thinking: 'balanced', maxOutputTokens: 16_384, timeoutMs: SLOW_CALL_TIMEOUT_MS,
     });
     let plan = normalizePlan(res.json, req, res.model);
     let designNote = '';
@@ -104,7 +111,8 @@ class GeminiBrain implements TutorBrain {
     if (problems.length) {
       const repair = await callJSON<any>(this.env, {
         model: this.m('planner'), system: TUTOR_PERSONA,
-        input: planRepairPrompt(JSON.stringify(plan), problems, req), schema: PLAN_SCHEMA, thinking: 'balanced',
+        input: planRepairPrompt(JSON.stringify(plan), problems, req), schema: PLAN_SCHEMA,
+        thinking: 'balanced', maxOutputTokens: 16_384, timeoutMs: SLOW_CALL_TIMEOUT_MS,
       });
       const repaired = normalizePlan(repair.json, req, repair.model);
       const valid = repaired.beats.filter((b) => validateBeat(b).ok);
@@ -161,7 +169,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: feedbackPrompt({ ...a, model: a.model ?? a.model, timing: a.profile.style.correctionTiming } as any),
-      schema: FEEDBACK_SCHEMA, thinking: 'balanced',
+      schema: FEEDBACK_SCHEMA, thinking: 'balanced', maxOutputTokens: 8192,
     });
     return { feedback: normalizeFeedback(res.json, a.beat, a.model?.overall?.cefr ?? 'A2'), meta: metaOf(res) };
   }
@@ -170,7 +178,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: `Mark this piece of writing against its rubric.\n\nPROMPT: ${a.beat.openEnded?.promptJA}\nRUBRIC: ${JSON.stringify(a.beat.openEnded?.rubric)}\nLEARNER LEVEL: ${a.level}\nLEARNER WROTE:\n${a.text}\n\nMarking rules: judge task achievement first, then range, accuracy, cohesion. Maximum 3 notices, each with an \`elicit\` question in Japanese that would let them self-correct. Quote their own words in wins. Do not correct errors above their level that they could not plausibly know.\n\nReturn JSON matching the feedback schema.`,
-      schema: FEEDBACK_SCHEMA, thinking: 'balanced',
+      schema: FEEDBACK_SCHEMA, thinking: 'balanced', maxOutputTokens: 8192,
     });
     return { feedback: normalizeFeedback(res.json, a.beat, a.level), meta: metaOf(res) };
   }
@@ -179,7 +187,7 @@ class GeminiBrain implements TutorBrain {
     const res = await callJSON<any>(this.env, {
       model: this.m('tutor'), system: TUTOR_PERSONA,
       input: debriefPrompt(a.plan, a.transcript, a.profile.style.correctionTiming),
-      thinking: 'balanced',
+      thinking: 'balanced', maxOutputTokens: 8192,
     });
     return { debrief: normalizeDebrief(res.json), meta: metaOf(res) };
   }
@@ -191,8 +199,10 @@ class GeminiBrain implements TutorBrain {
       // The one call that must never free-form: it runs on the reasoning model over the
       // noisiest input in the app while the learner watches a spinner. Without the schema
       // the pro model writes a tutor's essay, and the parser meets prose, not JSON.
+      // Same latency lesson as planSession: low thinking + a 16k ceiling keeps this
+      // under the gateway timeout where high thinking + 32k did not.
       schema: PLACEMENT_SCHEMA,
-      thinking: 'deep',
+      thinking: 'balanced', maxOutputTokens: 16_384, timeoutMs: SLOW_CALL_TIMEOUT_MS,
     });
     const j = res.json as any;
     return {
@@ -207,19 +217,19 @@ class GeminiBrain implements TutorBrain {
   }
 
   async gloss(a: Parameters<TutorBrain['gloss']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('fast'), input: glossPrompt(a.term, a.context, a.level), thinking: 'bulk' });
+    const res = await callJSON<any>(this.env, { model: this.m('fast'), input: glossPrompt(a.term, a.context, a.level), thinking: 'bulk', maxOutputTokens: 2048 });
     const j = res.json as any;
     return { reading: j.reading ?? '', meaningEN: j.meaningEN ?? '', pos: j.pos ?? '', note: j.note ?? '', example: j.example ?? '', exampleEN: j.exampleEN ?? '', meta: metaOf(res) };
   }
 
   async story(a: Parameters<TutorBrain['story']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: storyPrompt(a), thinking: 'balanced' });
+    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: storyPrompt(a), thinking: 'balanced', maxOutputTokens: 4096 });
     const j = res.json as any;
     return { titleJA: j.titleJA, titleEN: j.titleEN, text: j.text, glossary: j.glossary ?? [], hook: j.hook ?? '', question: j.question ?? { prompt: '', options: [], answer: '', explanation: '' }, meta: metaOf(res) };
   }
 
   async register(a: Parameters<TutorBrain['register']>[0]) {
-    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: registerPrompt(a.content, a.registers), thinking: 'balanced' });
+    const res = await callJSON<any>(this.env, { model: this.m('tutor'), input: registerPrompt(a.content, a.registers), thinking: 'balanced', maxOutputTokens: 4096 });
     const j = res.json as any;
     return { items: j.items ?? [], meta: metaOf(res) };
   }
@@ -242,7 +252,7 @@ Rules:
 - "replan" if the whole approach is mismatched (too hard, too easy, the learner asked).
 - "wrap" if time is short or they are clearly fatigued (short answers, many skips, "too hard" twice).
 Answer in JSON: {action, reason (one sentence, no jargon), injectKinds?}`,
-      thinking: 'bulk',
+      thinking: 'bulk', maxOutputTokens: 2048,
     });
     const j = res.json as any;
     const action = ['continue', 'inject', 'replan', 'wrap'].includes(j?.action) ? j.action : 'continue';
@@ -253,7 +263,7 @@ Answer in JSON: {action, reason (one sentence, no jargon), injectKinds?}`,
     const res = await callJSON<any>(this.env, {
       model: this.m('fast'),
       input: `Rewrite this Japanese passage so that a ${a.level} learner reading at 96% known-vocabulary coverage can understand it. Keep the same information and roughly the same length. Only these words may be new to them: up to ${a.allowedNew} items. Prefer simpler syntax over shorter text: split complex clauses, use high-frequency connectives, keep naturalness.\n\nPASSAGE:\n${a.text}\n\nTheir known vocabulary sample: ${a.knownWords.slice(0, 60).join('、')}\n\nReturn JSON {text} only.`,
-      thinking: 'bulk',
+      thinking: 'bulk', maxOutputTokens: 4096,
     });
     return { text: (res.json as any)?.text ?? a.text, meta: metaOf(res) };
   }

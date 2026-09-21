@@ -69,6 +69,9 @@ export interface ModelCall {
   background?: boolean;
   /** Function declarations (Live-style `{name, description, parameters}`). */
   tools?: unknown[];
+  /** Wall-clock budget for this call in ms. Defaults to 60s; the planner and placement
+   *  synthesis pass the slower 90s budget (see SLOW_CALL_TIMEOUT_MS). */
+  timeoutMs?: number;
 }
 
 export interface ModelResult<T = unknown> {
@@ -108,8 +111,18 @@ const DEFAULT_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 /** Output ceiling for structured calls that don't ask for a specific one. Generous on
  *  purpose: `max_output_tokens` pays for thoughts *and* the answer, and a truncated
- *  object is worth exactly nothing to the parser. */
-const SCHEMA_OUTPUT_TOKENS = 32_768;
+ *  object is worth exactly nothing to the parser — but not unbounded: this used to be
+ *  32k, which gave the reasoning model room to think past the gateway/edge timeout and
+ *  surface as `gemini 524`. The largest payload in the app (a full session plan) runs
+ *  ~4–8k tokens, so 16k leaves ample headroom for thoughts on top. */
+const SCHEMA_OUTPUT_TOKENS = 16_384;
+
+/** Wall-clock budget per model call. Cloudflare's edge/gateway timeout is 100s, so our
+ *  own ceiling sits inside it: a slow generation fails as a clear, retryable error
+ *  instead of a bare `gemini 524` after minutes of spinner. */
+const DEFAULT_TIMEOUT_MS = 60_000;
+/** The two calls allowed to think longest: session planning and placement synthesis. */
+export const SLOW_CALL_TIMEOUT_MS = 90_000;
 
 export function baseUrl(env: Env): { url: string; transport: 'gateway' | 'direct' } {
   if (env.CF_AI_GATEWAY_ACCOUNT && env.CF_AI_GATEWAY_ID) {
@@ -435,6 +448,12 @@ function describeError(status: number, raw: string): string {
     code = j?.error?.code ?? j?.error?.status ?? '';
     message = j?.error?.message ?? message;
   } catch { /* not JSON — keep the raw text */ }
+  // 524/504/408 (and timeouts in any vocabulary) mean the model was too slow, not that
+  // the request was wrong. Say that plainly: the client shows this message verbatim
+  // next to a retry button, and `error code: 524` tells a learner nothing.
+  if (status === 408 || status === 504 || status === 524 || /timed?\s*out|deadline\s*exceeded/i.test(`${code} ${message}`)) {
+    return `The AI took too long to answer (gemini ${status}${code ? ` ${code}` : ''}) and the request timed out. This is usually transient — try again in a few seconds.`;
+  }
   const hint = /parameter_unknown|Unknown parameter|Unknown name/i.test(`${code} ${message}`)
     ? ' (the Interactions API rejects unknown fields instead of ignoring them — check names against https://ai.google.dev/api/interactions-api-v1)'
     : '';
@@ -488,6 +507,7 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
   const { url, transport } = baseUrl(env);
   const started = Date.now();
   const body = interactionBody(call);
+  const timeoutMs = call.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   let res: Response;
   try {
@@ -495,11 +515,22 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
       method: 'POST',
       headers: headers(env),
       body: JSON.stringify(body),
+      // Our own ceiling, inside the 100s edge/gateway timeout: a reasoning model on a
+      // slow day will happily think past it, and the alternative to aborting here is a
+      // bare `gemini 524` after minutes of spinner (or a Cloudflare 524 with no JSON at
+      // all). The caller reports this; the UI offers a retry.
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
-    // DNS/TLS/timeout: the model was never even reached. Same class of failure as an
+    const e = err as Error;
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      throw new ModelCallError(
+        `The AI took too long to answer (over ${Math.round(timeoutMs / 1000)}s on ${call.model}) and the request was stopped. This is usually transient — try again.`,
+      );
+    }
+    // DNS/TLS: the model was never even reached. Same class of failure as an
     // HTTP error from its perspective — report it, never degrade silently.
-    throw new ModelCallError(`gemini unreachable: ${(err as Error).message}`);
+    throw new ModelCallError(`gemini unreachable: ${e.message}`);
   }
   const raw = await res.text();
   if (!res.ok) throw new ModelCallError(describeError(res.status, raw), res.status);
@@ -523,6 +554,11 @@ export async function callModel(env: Env, call: ModelCall): Promise<ModelResult>
  * Structured call with one automatic repair attempt. If the repair still does not
  * parse, this throws ModelOutputError — callers used to fall back to scripted
  * content here, which is exactly the silent degradation we removed.
+ *
+ * Note the repair covers *invalid output*, not transport failures: a timeout or HTTP
+ * error throws straight through with no silent second generation, because a second
+ * 60–90s call the learner didn't ask for is worse than a clear error with a retry
+ * button.
  *
  * The repair is not a rerun of the same coin flip. The two realistic failure modes are
  * (a) a reasoning model narrating instead of answering and (b) the JSON being cut off
@@ -784,11 +820,17 @@ export async function createEphemeralToken(
   const { url, transport } = baseUrl(env);
   const now = Date.now();
   const expiresAt = now + (opts.minutes ?? 30) * 60_000;
-  const res = await fetch(`${url}/auth_tokens`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify(tokenBody(opts, now)),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${url}/auth_tokens`, {
+      method: 'POST',
+      headers: headers(env),
+      body: JSON.stringify(tokenBody(opts, now)),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    throw new ModelCallError(`auth_tokens unreachable: ${(err as Error).message}`);
+  }
   const raw = await res.text();
   if (!res.ok) throw new ModelCallError(describeError(res.status, raw), res.status);
   let body: any;
@@ -835,11 +877,20 @@ export async function synthesize(
 ): Promise<{ audioBase64: string; mimeType: string } | null> {
   if (!hasKey(env)) return null;
   const { url } = baseUrl(env);
-  const res = await fetch(`${url}/interactions`, {
-    method: 'POST',
-    headers: headers(env),
-    body: JSON.stringify(ttsBody(env, text, opts)),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${url}/interactions`, {
+      method: 'POST',
+      headers: headers(env),
+      body: JSON.stringify(ttsBody(env, text, opts)),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    // Same deal as an HTTP error: the browser fallback covers it, but the reason
+    // belongs in the log, not in a silent null.
+    console.warn(`tts: request failed (${(err as Error)?.message}) — browser fallback`);
+    return null;
+  }
   if (!res.ok) {
     // The caller falls back to browser speech synthesis, which is a normal outcome —
     // but the reason belongs in the log, not in a silent null.

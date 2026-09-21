@@ -398,21 +398,24 @@ app.post('/api/session/start', async (c) => {
   const { plan, meta } = await tutor.planSession(reqObj);
 
   // Comprehensible-input gate: generated passages must sit in the 95–98% band.
+  // Simplifications run concurrently — sequential model calls here would stack latency
+  // on top of an already slow planner call, pushing the whole request toward the timeout.
   const knownSet = new Set((await l.dueCards(200)).map((d) => d.surface));
-  for (const b of plan.beats) {
-    if (b.reading?.text) {
-      const cov = estimateCoverage(b.reading.text, (t) => knownSet.has(t) || t.length <= 1);
-      const target = cefrIndex(ctx.model.overall.cefr) < 3 ? 0.95 : 0.96;
-      if (cov.coverage < target - 0.06) {
-        const sim = await tutor.simplify({
-          text: b.reading.text, level: ctx.model.overall.cefr,
-          knownWords: [...knownSet].slice(0, 80), allowedNew: 3,
-        });
-        b.reading.text = sim.text;
-        b.why += ` (Simplified to sit inside 95–98% known vocabulary — the original was too dense to be comfortable input.)`;
-      }
-    }
-  }
+  const knownSample = [...knownSet].slice(0, 80);
+  // Alias for the closure below: narrowing on ctx.model does not survive into callbacks.
+  const currentModel = ctx.model;
+  const simplifyTarget = cefrIndex(currentModel.overall.cefr) < 3 ? 0.95 : 0.96;
+  await Promise.all(plan.beats.map(async (b) => {
+    if (!b.reading?.text) return;
+    const cov = estimateCoverage(b.reading.text, (t) => knownSet.has(t) || t.length <= 1);
+    if (cov.coverage >= simplifyTarget - 0.06) return;
+    const sim = await tutor.simplify({
+      text: b.reading.text, level: currentModel.overall.cefr,
+      knownWords: knownSample, allowedNew: 3,
+    });
+    b.reading.text = sim.text;
+    b.why += ` (Simplified to sit inside 95–98% known vocabulary — the original was too dense to be comfortable input.)`;
+  }));
 
   const cardInfo = await l.addCards(plan.beats.flatMap((b) => b.targets).slice(0, 12), ctx.model.overall.cefr);
   await l.startSession(plan, mode);

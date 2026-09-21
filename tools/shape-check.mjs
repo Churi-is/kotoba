@@ -59,7 +59,7 @@ check(
 );
 check('previous_interaction_id carried', body.previous_interaction_id === 'int_123');
 check('thinking_level inside generation_config', body.generation_config?.thinking_level === 'low');
-check('schema calls get an output ceiling', body.generation_config?.max_output_tokens === 32_768);
+check('schema calls get an output ceiling', body.generation_config?.max_output_tokens === 16_384);
 
 const plain = interactionBody({ model: 'gemini-3.8-flash', input: 'hi', maxOutputTokens: 2048, thinking: 'balanced' });
 check('plain call: no response_format', plain.response_format === undefined);
